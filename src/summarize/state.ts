@@ -60,15 +60,38 @@ export interface SessionShape {
   addedWithTests: boolean;
 }
 
+/** A feature/phase line a document claims to have finished (or not). */
+export interface FeatureRow {
+  file: string;
+  name: string;
+  done: boolean;
+  note: string;
+}
+
+/** Prose the project wrote about itself, used to describe its scope. */
+export interface ScopeDoc {
+  file: string;
+  excerpt: string;
+}
+
 export interface ProjectState {
   session: SessionShape | null;
   markers: UnfinishedMarker[];
   checklists: ChecklistState[];
   statusDocs: StatusDocState[];
+  /** Feature/phase lines lifted out of the project's own documents. */
+  featureRows: FeatureRow[];
+  /** README/PRD/overview prose, so a brief can say what the project *is*. */
+  scopeDocs: ScopeDoc[];
   /** Recently added modules with no test file anywhere in the repo. */
   untested: string[];
   scannedFiles: number;
 }
+
+/** Documents allowed to describe the project's scope. */
+const SCOPE_DOC_NAME = /(readme|prd|overview|scope|requirements|design|architecture|about)/i;
+const SCOPE_SECTION =
+  /^(overview|purpose|about|introduction|what it does|problem statement|goals|description|summary|background|abstract)$/i;
 
 export interface StateOptions {
   /** How many recent commits to treat as "the session". */
@@ -154,6 +177,9 @@ const STATUS_DOC_NAME =
   /(status|roadmap|progress|plan|todo|checklist|changelog|prd|completion|remaining|summary|readme)/i;
 
 /** Only lines that talk about progress count as a claim. */
+const STATUS_DONE = /(✅|✔|\bcomplete|completed|\bdone\b|shipped|implemented|production[- ]ready|100%)/i;
+const STATUS_OPEN = /(❌|⏳|🚧|\bplanned\b|pending|not started|\btodo\b|deferred|\bfuture\b|remaining)/i;
+
 const STATUS_CLAIM =
   /(complete|completed|completion|remaining|pending|in progress|not yet|unfinished|blocked|roadmap|progress|to do|todo|next step)/i;
 
@@ -189,6 +215,15 @@ async function listRepoFiles(projectPath: string): Promise<string[]> {
     if (files.length > 0) return files;
   }
   return walkProjectFiles(projectPath, 4, 3000);
+}
+
+/** Title-case lines with no punctuation are headings or table rows, not prose. */
+function looksLikeTitle(clean: string, ratio = 0.7, minWords = 3): boolean {
+  if (/[.:,;!?]/.test(clean)) return false;
+  const words = clean.split(/\s+/).filter((word) => /[A-Za-z]/.test(word));
+  if (words.length < minWords) return false;
+  const capitalized = words.filter((word) => /^[A-Z0-9]/.test(word)).length;
+  return capitalized / words.length >= ratio;
 }
 
 function stripMarkdown(line: string): string {
@@ -283,9 +318,7 @@ export function findClaims(text: string): string[] {
     if (/(^\s*[$>]|\s-m\s|--|https?:|\/)/.test(clean)) continue;
     if (/^\d+\.\s/.test(clean)) continue;
     // Table headers and title headings are not statements about progress.
-    const words = clean.split(/\s+/).filter((word) => /[A-Za-z]/.test(word));
-    const capitalized = words.filter((word) => /^[A-Z0-9]/.test(word)).length;
-    if (words.length >= 4 && !/[:.,;!?]/.test(clean) && capitalized / words.length >= 0.8) continue;
+    if (looksLikeTitle(clean, 0.8, 4)) continue;
     if (!STATUS_CLAIM.test(clean)) continue;
     if (claims.includes(clean)) continue;
     claims.push(clean);
@@ -335,6 +368,102 @@ function dominantArea(files: string[]): string | null {
     }
   }
   return best;
+}
+
+/**
+ * Feature/phase lines from the project's own documents: markdown tables with a
+ * status column, and `✅ **Phase 1:** ...` style summary lists. This is what
+ * turns "11 commits" into "the seven planned phases are done".
+ */
+export function scanFeatureRows(text: string, file: string): FeatureRow[] {
+  const rows: FeatureRow[] = [];
+  for (const line of text.split('\n')) {
+    if (/^\s*\|/.test(line)) {
+      const cells = line.split('|').map((cell) => stripMarkdown(cell));
+      const usable = cells.filter((cell) => cell.length > 0);
+      if (usable.length < 2) continue;
+      const name = usable[0] ?? '';
+      const status = usable[1] ?? '';
+      if (/^[-: ]+$/.test(name)) continue; // separator row
+      if (/^(phase|feature|item|component|area|status|step)$/i.test(name)) continue; // header
+      const done = STATUS_DONE.test(status);
+      const open = STATUS_OPEN.test(status);
+      if (!done && !open) continue;
+      rows.push({
+        file,
+        name: truncate(name, 80),
+        done: done && !open,
+        note: truncate(usable[2] ?? '', 90),
+      });
+      continue;
+    }
+    const marked = line.match(/^\s*[-*]?\s*(✅|✔️?|❌|⏳|🚧)\s*(.+)$/u);
+    if (!marked) continue;
+    const label = stripMarkdown(marked[2] ?? '');
+    if (label.length < 4 || label.length > 110) continue;
+    rows.push({
+      file,
+      name: label,
+      done: /✅|✔/u.test(marked[1] ?? ''),
+      note: '',
+    });
+  }
+  return rows;
+}
+
+/** The section of a document that describes what the project is for. */
+export function extractScope(text: string, maxChars: number): string | null {
+  const lines = text.split('\n');
+  // "## 1. Overview" and "### 1.1 Purpose" are overview sections too.
+  const headingTitle = (line: string): { level: number; title: string } | null => {
+    const heading = line.match(/^(#{1,4})\s+(.+?)\s*$/);
+    if (!heading) return null;
+    return {
+      level: (heading[1] ?? '#').length,
+      title: stripMarkdown(heading[2] ?? '')
+        .replace(/^[\d.\s]+/, '')
+        .trim()
+        .toLowerCase(),
+    };
+  };
+  let start = -1;
+  let startLevel = 4;
+  for (let index = 0; index < lines.length; index += 1) {
+    const heading = headingTitle(lines[index] ?? '');
+    if (heading && SCOPE_SECTION.test(heading.title)) {
+      start = index;
+      startLevel = heading.level;
+      break;
+    }
+  }
+  const body: string[] = [];
+  let fenced = false;
+  for (let index = start >= 0 ? start + 1 : 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? '';
+    if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+    if (fenced) continue;
+    const sub = headingTitle(line);
+    const finish = start >= 0 && sub !== null && sub.level <= startLevel;
+    if (finish) break; // the next section of the same rank ends this one
+    if (sub !== null) continue; // sub-headings inside the section are structural
+    if (start < 0 && body.length === 0) {
+      // With no overview heading, skip the document's title/tagline lines.
+      const candidate = stripMarkdown(line);
+      const isTagline = !/[.!?]$/.test(candidate) && candidate.split(/\s+/).length <= 14;
+      if (candidate.length < 40 || looksLikeTitle(candidate) || isTagline) continue;
+    }
+    const clean = stripMarkdown(line);
+    if (clean.length === 0) {
+      if (body.length > 0) body.push('');
+      continue;
+    }
+    if (/^[-=]{3,}$/.test(clean)) continue;
+    if (/(^\s*[$>]|--|https?:)/.test(line)) continue;
+    body.push(clean);
+    if (body.join(' ').length >= maxChars) break;
+  }
+  const joined = body.filter((line) => line.length > 0).join(' ').trim();
+  return joined.length > 40 ? joined.slice(0, maxChars) : null;
 }
 
 /**
@@ -481,7 +610,21 @@ export async function analyzeProjectState(
 
   const checklists: ChecklistState[] = [];
   const statusDocs: StatusDocState[] = [];
+  const featureRows: FeatureRow[] = [];
+  const scopeDocs: ScopeDoc[] = [];
+  const seenFeatures = new Set<string>();
   if (exists) {
+    for (const rel of repoFiles
+      .filter((file) => file.toLowerCase().endsWith('.md'))
+      .filter((file) => SCOPE_DOC_NAME.test(path.basename(file)))
+      .sort((a, b) => docScore(b) - docScore(a) || a.split('/').length - b.split('/').length || a.localeCompare(b))
+      .slice(0, 8)) {
+      if (scopeDocs.length >= 2) break;
+      const text = safeRead(path.join(root, rel));
+      if (text === null) continue;
+      const excerpt = extractScope(text, 700);
+      if (excerpt) scopeDocs.push({ file: rel, excerpt });
+    }
     const docs = repoFiles
       .filter((file) => file.toLowerCase().endsWith('.md'))
       .filter((file) => STATUS_DOC_NAME.test(path.basename(file)))
@@ -503,6 +646,13 @@ export async function analyzeProjectState(
         ...all.filter((block) => !(block.kind === 'remaining' && block.open > 0)),
       ].slice(0, 6);
       for (const block of blocks) checklists.push(block);
+      // Feature/phase lines described by the project itself.
+      for (const row of scanFeatureRows(text, rel)) {
+        const key = row.name.toLowerCase().slice(0, 60);
+        if (seenFeatures.has(key) || featureRows.length >= 14) continue;
+        seenFeatures.add(key);
+        featureRows.push(row);
+      }
       if (checklists.length > 30) break;
       const claims = findClaims(text);
       const used = statusDocs.reduce((sum, doc) => sum + doc.claims.length, 0);
@@ -549,9 +699,85 @@ export async function analyzeProjectState(
     markers,
     checklists: rankedChecklists,
     statusDocs,
+    featureRows,
+    scopeDocs,
     untested,
     scannedFiles,
   };
+}
+
+export interface ScopeInput {
+  projectName: string;
+  summary: string;
+  stack: string[];
+  languages: Array<{ language: string; files: number }>;
+  topLevel: Array<{ name: string; kind: 'dir' | 'file' }>;
+  gitRemote: string | null;
+  branch: string | null;
+  scopeDocs: ScopeDoc[];
+}
+
+/** First sentence of a paragraph, so a quote reads like a sentence. */
+function firstSentence(text: string, maxChars = 300): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  const end = clean.search(/\.\s/);
+  const sentence = end > 40 ? clean.slice(0, end + 1) : clean;
+  return sentence.length > maxChars ? `${sentence.slice(0, maxChars - 1)}…` : sentence;
+}
+
+/**
+ * "What this project is" — in the project's own words where it has them.
+ * Reads the README/PRD/overview prose rather than guessing from file names.
+ */
+export function projectScopeNarrative(input: ScopeInput): string[] {
+  const out: string[] = [];
+  const dirs = input.topLevel
+    .filter((entry) => entry.kind === 'dir')
+    .map((entry) => `${entry.name.replace(/\/$/, '')}/`)
+    .slice(0, 4);
+  const stack = input.stack.length > 0 ? input.stack.join(' + ') : input.languages[0]?.language ?? null;
+  const languages = input.languages
+    .slice(0, 3)
+    .map((entry) => `${entry.files} ${entry.language.toLowerCase()}`)
+    .join(', ');
+  const facts: string[] = [];
+  facts.push(stack ? `a ${stack} project${languages ? ` (${languages} files)` : ''}` : 'a code project');
+  if (dirs.length > 0) facts.push(`laid out as ${dirs.join(', ')}`);
+  if (input.gitRemote) facts.push(`tracked at ${input.gitRemote}${input.branch ? ` on \`${input.branch}\`` : ''}`);
+  const summary = input.summary && input.summary.length > 8 ? input.summary : null;
+  out.push(`${input.projectName}${summary ? ` — “${summary}”` : ''} — is ${facts.join(', ')}.`);
+  for (const doc of input.scopeDocs) {
+    const sentence = firstSentence(doc.excerpt);
+    if (sentence.length > 40) out.push(`Its own words (\`${doc.file}\`): “${sentence}”`);
+  }
+  return out;
+}
+
+/**
+ * "What could come next" — the project's own roadmap items first, then concrete
+ * loose ends. Always attributed, so the reader knows who is proposing it.
+ */
+export function projectImprovementNarrative(state: ProjectState, limit = 3): string[] {
+  // Roadmap items first, so every idea in the section can be attributed.
+  const roadmap: string[] = [];
+  const push = (idea: string): void => {
+    if (!roadmap.includes(idea)) roadmap.push(idea);
+  };
+  for (const block of state.checklists.filter((entry) => entry.kind === 'remaining' && entry.open > 0)) {
+    for (const item of block.remaining) push(`${truncate(item, 130)} (\`${block.file}\`)`);
+  }
+  for (const row of state.featureRows.filter((entry) => !entry.done)) {
+    push(`${truncate(row.name, 130)}${row.note ? ` — ${row.note}` : ''} (\`${row.file}\`)`);
+  }
+  if (roadmap.length > 0) return roadmap.slice(0, limit);
+
+  // No roadmap: fall back to concrete loose ends, which carry their own source.
+  const loose: string[] = [];
+  for (const file of state.untested) loose.push(`add tests for \`${file}\``);
+  for (const marker of state.markers) {
+    loose.push(`close the ${marker.kind} in \`${marker.file}:${marker.line}\` — ${truncate(marker.text, 80)}`);
+  }
+  return loose.slice(0, limit);
 }
 
 export interface StateNarrativeContext {
@@ -626,6 +852,15 @@ export function projectStateNarrative(state: ProjectState, ctx: StateNarrativeCo
         : '';
     out.push(`\`${doc.file}\` states: ${doc.claims.map((claim) => `"${claim}"`).join('; ')}.${dated}`);
   }
+  const doneFeatures = state.featureRows.filter((row) => row.done);
+  if (doneFeatures.length > 1) {
+    out.push(
+      `What the documents list as implemented: ${doneFeatures
+        .slice(0, 7)
+        .map((row) => `${row.name.replace(/[:\s]+$/, '')}${row.note ? ` (${row.note})` : ''}`)
+        .join('; ')}.`,
+    );
+  }
   const claimsDone = state.statusDocs.some((doc) => doc.claims.some((claim) => COMPLETE_CLAIM.test(claim)));
   const openCount = backlog.reduce((sum, entry) => sum + entry.open, 0) + state.markers.length;
   if (claimsDone && openCount > 0) {
@@ -679,20 +914,7 @@ export function projectStateNarrative(state: ProjectState, ctx: StateNarrativeCo
     );
   }
 
-  /* -------- 4. the honest read, and the next move -------- */
-  const next: string[] = [];
-  const firstBacklog = backlog[0];
-  if (firstBacklog?.remaining[0]) {
-    next.push(`the first unchecked item in \`${firstBacklog.file}\` — "${firstBacklog.remaining[0]}"`);
-  }
-  const marker = state.markers.find((entry) => entry.kind !== 'placeholder');
-  if (next.length === 0 && marker) next.push(`the ${marker.kind} in \`${marker.file}:${marker.line}\``);
-  if (next.length === 0 && state.untested.length > 0) next.push(`writing a test for \`${state.untested[0]}\``);
-  const placeholder = state.markers[0];
-  if (next.length === 0 && placeholder) {
-    next.push(`the gap noted in \`${placeholder.file}:${placeholder.line}\` — "${truncate(placeholder.text, 60)}"`);
-  }
-
+  /* -------- 4. the honest read -------- */
   const bits: string[] = [];
   if (ctx.dirtyFiles.length > 0) {
     bits.push(
@@ -710,7 +932,6 @@ export function projectStateNarrative(state: ProjectState, ctx: StateNarrativeCo
     const sentence = bits.join('; ');
     out.push(`${sentence.charAt(0).toUpperCase()}${sentence.slice(1)}.`);
   }
-  if (next.length > 0) out.push(`**The likely next step:** ${next[0]}.`);
 
   return out;
 }

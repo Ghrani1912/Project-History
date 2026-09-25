@@ -232,7 +232,7 @@ test('heuristic brief reports failing commands and open threads', async () => {
   const brief = await generateBrief(db, DEFAULT_CONFIG, project, { heuristicOnly: true });
   assert.equal(brief.generator, 'heuristic');
   assert.match(brief.text, /where you left off/i);
-  assert.match(brief.text, /## Open threads/);
+  assert.match(brief.text, /## Loose ends/);
   assert.match(brief.text, /npm run build/, 'failing command should be surfaced');
   assert.match(brief.text, /pinned? node 20|pin node 20/);
 
@@ -268,7 +268,8 @@ test('heuristicBrief handles an empty project without crashing', () => {
     stats: { events: 0, commits: 0, chatTurns: 0, firstTs: null },
     watermark: 0,
   });
-  assert.match(text, /No captured activity yet/);
+  assert.match(text, /# empty — where you left off/);
+  assert.match(text, /## What it is/);
 });
 
 test('parseCommitFiles reads the object shape and the legacy path array', () => {
@@ -397,8 +398,11 @@ test('heuristicBrief prints the narrative and per-commit line counts', async () 
     ts: Date.now() - 3 * 3600_000,
   });
   const brief = await generateBrief(db, DEFAULT_CONFIG, project, { heuristicOnly: true });
-  assert.match(brief.text, /## Where you left off\nYou were last active/);
-  assert.match(brief.text, /src\/a\.ts \+12\/-3/, 'the commits list shows what the commit changed');
+  assert.match(brief.text, /## Where it stands/);
+  // The commit log lives in `brain timeline`; the brief must not dump it.
+  assert.ok(!/## Recent commits/.test(brief.text), 'the brief should not list commits');
+  assert.ok(!/\+12\/-3/.test(brief.text), 'the brief should not print per-file line counts');
+  assert.match(brief.text, /brain timeline/);
   db.close();
 });
 

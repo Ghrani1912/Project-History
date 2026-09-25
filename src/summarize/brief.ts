@@ -15,6 +15,8 @@ import { formatDay, plural, relativeTime, truncate } from '../util/format.js';
 import { buildProjectProfile, type ProjectProfile } from './profile.js';
 import {
   analyzeProjectState,
+  projectImprovementNarrative,
+  projectScopeNarrative,
   projectStateNarrative,
   type ProjectState,
 } from './state.js';
@@ -444,53 +446,35 @@ function captureHint(hooked: SupportedShell[], invoking: SupportedShell | null, 
 export function heuristicBrief(data: BriefData): string {
   const lines: string[] = [];
   const { project } = data;
-  const limit = 10;
-  const oldest = data.timeline.length > 0 ? data.timeline[data.timeline.length - 1]?.ts : undefined;
   lines.push(`# ${project.name} — where you left off`);
   lines.push('');
   lines.push(
-    `_${relativeTime(data.generatedAt)} generated · ${plural(data.stats.commits, 'commit')} · ${
-      data.stats.events
-    } events · ${data.stats.chatTurns} chat turns · covering since ${
-      oldest ? formatDay(oldest) : (data.stats.firstTs ? formatDay(data.stats.firstTs) : 'today')
+    `_generated ${relativeTime(data.generatedAt)} · ${plural(data.stats.commits, 'commit')}${
+      data.stats.firstTs ? ` since ${formatDay(data.stats.firstTs)}` : ''
     }_`,
   );
   lines.push('');
 
-  /* -------- what we know about the project (stored at register time) -------- */
+  /* Identity, stack and layout are written as prose in "What it is" below. */
   const profile = data.profile;
-  lines.push(`**Path:** \`${project.path}\``);
-  lines.push(`**Summary:** ${profile?.summary ?? project.summary ?? 'not analysed yet — re-run: brain register'}`);
-  const stack = profile?.stack ?? (project.stack ? project.stack.split(', ') : data.stack);
-  if (stack.length > 0) lines.push(`**Stack:** ${stack.join(', ')}`);
-  if (profile && profile.languages.length > 0) {
-    lines.push(
-      `**Languages:** ${profile.languages
-        .slice(0, 5)
-        .map((entry) => `${entry.language} (${plural(entry.files, 'file')})`)
-        .join(', ')}`,
-    );
-  }
-  const remote = profile?.gitRemote ?? project.git_remote;
-  if (remote || profile?.isGitRepo) {
-    lines.push(
-      `**Git:** ${remote ?? 'no remote'}${profile?.branch ? ` · ${profile.branch}` : ''} · ${plural(
-        data.stats.commits,
-        'commit',
-      )}`,
-    );
-  }
-  if (profile && profile.topLevel.length > 0) {
-    lines.push(`**Layout:** ${profile.topLevel.map((entry) => entry.name).join(' ')}`);
-  }
-  if (profile && profile.entryPoints.length > 0) {
-    lines.push(`**Entry points:** ${profile.entryPoints.map((entry) => `\`${entry}\``).join(', ')}`);
+
+  /* -------- what this project is, in its own words -------- */
+  const scope = projectScopeNarrative({
+    projectName: project.name,
+    summary: profile?.summary ?? project.summary ?? '',
+    stack: profile?.stack ?? data.stack,
+    languages: profile?.languages ?? [],
+    topLevel: profile?.topLevel ?? [],
+    gitRemote: profile?.gitRemote ?? project.git_remote,
+    branch: profile?.branch ?? null,
+    scopeDocs: data.state?.scopeDocs ?? [],
+  });
+  if (scope.length > 0) {
+    lines.push('## What it is');
+    for (const paragraph of scope) lines.push(paragraph, '');
   }
 
-  /*
-   * The state of the project: read off the repository, not off the commit list.
-   * This is the part a GitHub history cannot give you.
-   */
+  /* -------- the current state: what is done and what is not -------- */
   const stateProse = data.state
     ? projectStateNarrative(data.state, {
         generatedAt: data.generatedAt,
@@ -501,32 +485,23 @@ export function heuristicBrief(data: BriefData): string {
       })
     : [];
   if (stateProse.length > 0) {
-    lines.push('\n## Where the project stands');
+    lines.push('## Where it stands');
     for (const paragraph of stateProse) lines.push(paragraph, '');
   }
 
-  /*
-   * The heart of the brief: a prose handover, not a row dump. The bullet
-   * sections below are supporting evidence; this is the part that answers
-   * "what exactly was I in the middle of?".
-   */
-  lines.push('\n## Where you left off');
-  const narrative = activityNarrative(data);
-  for (const paragraph of narrative) lines.push(paragraph, '');
-
-  /* -------- which parts of the tree the recent work lived in -------- */
-  if (data.areas && data.areas.length > 1) {
-    lines.push('## Where the work went');
-    for (const area of data.areas) {
-      const diff = area.add + area.del > 0 ? `, +${area.add}/-${area.del} lines` : '';
-      lines.push(
-        `- **${area.name}** — ${plural(area.commits, 'commit')} touching ${plural(area.files, 'file')}${diff}`,
-      );
-    }
+  /* -------- where the project itself says it could go next -------- */
+  const ideas = data.state ? projectImprovementNarrative(data.state) : [];
+  if (ideas.length > 0) {
+    lines.push('## What could come next');
+    for (const idea of ideas) lines.push(`- ${idea}`);
     lines.push('');
   }
 
-  /* -------- anything the prose cannot carry: the last captured command -------- */
+  /* -------- loose ends: only what is genuinely dangling -------- */
+  const threads: string[] = [];
+  for (const cmd of data.failingCommands) {
+    threads.push(`\`${truncate(cmd, 90)}\` failed and was never re-run successfully`);
+  }
   const lastCommand = data.recentCommands[0];
   if (lastCommand) {
     let cmd = '';
@@ -536,106 +511,60 @@ export function heuristicBrief(data: BriefData): string {
       cmd = '';
     }
     if (cmd) {
-      lines.push(
-        `_Last captured command:_ \`${truncate(cmd, 90)}\`${
+      threads.push(
+        `the last command captured was \`${truncate(cmd, 80)}\`${
           lastCommand.exit_code ? ` (exit ${lastCommand.exit_code})` : ''
-        } — ${relativeTime(lastCommand.ts, data.generatedAt)}`,
+        }, ${relativeTime(lastCommand.ts, data.generatedAt)}`,
       );
-      lines.push('');
     }
   }
-
-  /* -------- timeline -------- */
-  lines.push('## Recent activity');
-  if (data.timeline.length === 0) {
-    lines.push('- No captured activity yet. Install the shell hook (`brain shell install`) and commit something.');
-  } else {
-    for (const entry of data.timeline.slice(0, limit)) {
-      lines.push(`- ${formatDay(entry.ts)} \`${entry.kind}\` ${truncate(entry.text, 120)}`);
-    }
-    if (data.timeline.length > limit) {
-      lines.push(`- … ${data.timeline.length - limit} more (run \`brain timeline\`)`);
-    }
-  }
-
-  /* -------- hot files -------- */
-  if (data.changedFiles && data.changedFiles.length > 0) {
-    lines.push('\n## What changed recently');
-    for (const file of data.changedFiles.slice(0, 6)) {
-      const diff = file.add + file.del > 0 ? `, +${file.add}/-${file.del} lines` : '';
-      lines.push(`- \`${truncate(file.path, 70)}\` — in ${plural(file.commits, 'commit')}${diff}`);
-    }
-    if (data.touchedFiles.length > 0) {
-      lines.push(`- Also touched (live): ${data.touchedFiles.slice(0, 5).map((f) => truncate(f, 50)).join(', ')}`);
-    }
-  }
-
-  /* -------- commits -------- */
-  lines.push('\n## Recent commits');
-  if (data.commits.length === 0) lines.push('- No commits ingested yet (`brain register` backfills history).');
-  else {
-    for (const commit of data.commits.slice(0, 6)) {
-      const subject = commitSubject(commit);
-      lines.push(
-        `- \`${commit.hash.slice(0, 7)}\` ${truncate(subject || '(no message)', 70)} — ${
-          commit.author ?? 'unknown'
-        }, ${relativeTime(commit.ts, data.generatedAt)}`,
-      );
-      // Without this a vague subject ("idk", "minor change") says nothing at all.
-      const files = filesForCommit(commit).slice(0, 3);
-      if (files.length > 0) {
-        lines.push(`  - ${files.map((file) => `\`${truncate(fileWithCounts(file), 56)}\``).join(', ')}`);
-      }
-    }
-  }
-
-  /* -------- decisions -------- */
-  lines.push('\n## Decisions');
-  if (data.decisions.length === 0) {
-    lines.push('- None logged. `brain log "decided X because Y"` to start the decision log.');
-  } else {
-    for (const decision of data.decisions.slice(0, 6)) {
-      lines.push(`- ${truncate(decision.text, 160)}${decision.tags ? ` (${decision.tags})` : ''}`);
-    }
-  }
-
-  /* -------- open threads -------- */
-  const threads: string[] = [];
-  for (const cmd of data.failingCommands) threads.push(`Failing command not yet fixed: \`${truncate(cmd, 90)}\``);
   if (data.dirtyFiles.length > 0) {
     threads.push(
-      `Uncommitted work in ${plural(data.dirtyFiles.length, 'file')}: ${data.dirtyFiles
+      `${plural(data.dirtyFiles.length, 'file')} uncommitted — ${data.dirtyFiles
         .slice(0, 4)
         .map((line) => truncate(line, 50))
         .join(', ')}`,
     );
   }
   if (data.touchedFiles.length > 0) {
-    threads.push(`Recently touched: ${data.touchedFiles.slice(0, 5).map((f) => truncate(f, 60)).join(', ')}`);
+    threads.push(
+      `live edits recently in ${data.touchedFiles.slice(0, 4).map((file) => truncate(file, 50)).join(', ')}`,
+    );
   }
-  if (data.testCommand) threads.push(`Test command: \`${data.testCommand}\``);
-  lines.push('\n## Open threads');
-  if (threads.length === 0) lines.push('- Nothing obviously open — clean working tree, no failing commands.');
-  else for (const thread of threads) lines.push(`- ${thread}`);
+  if (data.testCommand) threads.push(`test command: \`${data.testCommand}\``);
+  if (threads.length > 0) {
+    lines.push('## Loose ends');
+    for (const thread of threads) lines.push(`- ${thread}`);
+    lines.push('');
+  }
 
-  /* -------- capture health -------- */
+  /* -------- decisions, but only when there are any -------- */
+  if (data.decisions.length > 0) {
+    lines.push('## Decisions');
+    for (const decision of data.decisions.slice(0, 6)) {
+      lines.push(`- ${truncate(decision.text, 160)}${decision.tags ? ` (${decision.tags})` : ''}`);
+    }
+    lines.push('');
+  }
+
+  /* -------- capture health, kept short: this is operational, not content -------- */
   if (data.capture) {
     const capture = data.capture;
-    lines.push('\n## Capture');
+    const hooks =
+      capture.shellHooks.length > 0 ? capture.shellHooks.join(', ') : 'none installed';
+    lines.push('## Capture');
     lines.push(
-      `- ${plural(capture.events, 'command/file event')} · ${capture.commits} commits · ${capture.chatTurns} chat turns · ${
-        capture.decisions
-      } decisions`,
-    );
-    lines.push(
-      `- Shell hooks: ${capture.shellHooks.length > 0 ? capture.shellHooks.join(', ') : 'none installed'}${
+      `${plural(capture.events, 'event')} captured · shell hooks: ${hooks}${
         capture.invokingShell ? ` (this shell: ${capture.invokingShell})` : ''
       }`,
     );
-    if (capture.lastEventTs) lines.push(`- Last live event: ${relativeTime(capture.lastEventTs, data.generatedAt)}`);
-    if (capture.hint) lines.push(`- ${capture.hint}`);
+    if (capture.hint) lines.push(capture.hint);
+    lines.push('');
   }
 
+  lines.push(
+    '_Everything above is derived from the repository. Full history: `brain timeline` · questions: `brain ask "…"`._',
+  );
   return lines.join('\n');
 }
 
@@ -698,6 +627,16 @@ export function renderDigest(data: BriefData): string {
     }
   }
   if (data.state) {
+    lines.push('');
+    lines.push('What the project is (its own words, from the repository):');
+    for (const doc of data.state.scopeDocs) lines.push(`- ${doc.file}: ${truncate(doc.excerpt, 700)}`);
+    if (data.state.featureRows.length > 0) {
+      lines.push('');
+      lines.push('Features/phases the documents list (done or not):');
+      for (const row of data.state.featureRows) {
+        lines.push(`- [${row.done ? 'done' : 'open'}] ${row.name}${row.note ? ` — ${row.note}` : ''} (${row.file})`);
+      }
+    }
     const stateProse = projectStateNarrative(data.state, {
       generatedAt: data.generatedAt,
       projectName: data.project.name,
@@ -710,27 +649,11 @@ export function renderDigest(data: BriefData): string {
       lines.push('Project state read off the repository (facts, not guesses):');
       for (const paragraph of stateProse) lines.push(paragraph.replace(/\*\*/g, ''));
     }
-    if (data.state.markers.length > 0) {
+    const ideas = projectImprovementNarrative(data.state, 5);
+    if (ideas.length > 0) {
       lines.push('');
-      lines.push('Unfinished markers in recently changed code:');
-      for (const marker of data.state.markers) {
-        lines.push(`- ${marker.file}:${marker.line} ${marker.kind}: ${marker.text}`);
-      }
-    }
-    if (data.state.checklists.length > 0) {
-      lines.push('');
-      lines.push('Checklists found in the repository:');
-      for (const checklist of data.state.checklists) {
-        lines.push(
-          `- ${checklist.file}: ${checklist.done} done, ${checklist.open} open${
-            checklist.remaining.length > 0 ? ` (next: ${checklist.remaining.join(' | ')})` : ''
-          }`,
-        );
-      }
-    }
-    if (data.state.untested.length > 0) {
-      lines.push('');
-      lines.push(`Recently changed modules with no test file: ${data.state.untested.join(', ')}`);
+      lines.push('Ideas the project itself lists for what comes next:');
+      for (const idea of ideas) lines.push(`- ${idea.replace(/\*\*/g, '')}`);
     }
   }
   if (data.commits.length > 0) {
@@ -764,16 +687,15 @@ export function renderDigest(data: BriefData): string {
 export function briefPrompt(digest: string, projectName: string): string {
   return [
     `You are maintaining a local "second brain" for a developer. Below is raw captured activity for the project "${projectName}".`,
-    'Write a handover brief that lets the developer instantly remember what they were doing and exactly where they stopped.',
+    'Write the handover note this developer should read after a break. Friendly and concrete, like a colleague briefing them. Prose, not tables or inventories.',
     'Rules:',
-    '- Markdown, no preamble, no code fences. 240 words max.',
-    '- Start with "## Where the project stands" as prose (3-5 sentences) answering: did work stop at a natural stopping point or mid-task? What did the last session build or change, and in which part of the codebase? What do the project own docs claim about progress, and what is still visibly unfinished (unchecked checklist items, TODO/FIXME markers, untested modules)? End by naming the single most likely next task.',
-    '- Then "## Where you left off" written as prose (2-3 sentences): what the last session was working on, which part of the codebase it touched, how large the changes were, and how long ago that was.',
-    '- Then "## Open threads": bullets naming the concrete loose ends (uncommitted files, failing commands, half-finished areas), most important first.',
-    '- Then "## Pick up with": one sentence naming the single next action.',
-    '- Then "## Recent decisions" only if the data contains logged decisions; omit the section entirely otherwise.',
-    '- Name real files, commands and commit hashes from the data. Never invent anything the data does not support.',
-    '- If the commit messages are vague ("idk", "minor change"), say so plainly and describe the work from the changed files instead.',
+    '- Markdown, no preamble, no code fences. 220 words max.',
+    '- Use exactly three sections: "## What it is", "## Where it stands", "## What could come next".',
+    '- "What it is": 2-3 sentences on what the project is for and how it is built, using the project own README/PRD/overview wording. Do not list directories.',
+    '- "Where it stands": 3-5 sentences. Say whether work stopped at a natural finishing point or mid-task, which parts are implemented (use the feature/phase list), what the project own documents claim about progress, and what is still open (unchecked backlog items, TODO/FIXME markers, new modules without tests). Mention how long ago the last work was.',
+    '- "What could come next": up to three bullet points, drawn from the project own roadmap/future-work lists. Attribute each one to the document it came from. If the repository lists nothing, omit the section rather than inventing ideas.',
+    '- Do not list commits, files changed or per-file line counts: that history is available with `brain timeline`.',
+    '- Never invent features, files, commands or dates the data does not contain.',
     '',
     digest,
   ].join('\n');

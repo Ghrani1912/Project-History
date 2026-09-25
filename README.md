@@ -94,11 +94,13 @@ merge-sort into one honest timeline.
 - `brain ask "<query>" [-p project] [--days n] [--types decision,commit,chat,event] [--json]`
 
 **Insight**
-- `brain brief [-p project] [--cached] [--heuristic] [--auto]` — handover brief. Leads with **where the
-  project stands**: whether the last session added files or only edited them, whether new code shipped with
-  a test, what the repository's own status documents and checklists claim, its unchecked backlog items,
-  unfinished TODO/FIXME markers and newly added modules with no test. Then the stored project profile, hot
-  files, uncommitted work, failing commands and capture health
+- `brain brief [-p project] [--cached] [--heuristic] [--auto]` — the handover note, in three prose
+  sections: **What it is** (scope read from the project's own README/PRD), **Where it stands** (did the last
+  session finish an increment or stop mid-task, which features the docs list as implemented, what its own
+  documents claim, and what is still open: unchecked backlog items, TODO/FIXME markers, new modules with no
+  test), and **What could come next** (the project's own roadmap, attributed). Loose ends, decisions and
+  capture health follow only when they have something to say; the commit-by-commit history stays in
+  `brain timeline`
 - `brain timeline [--days n] [--kinds cmd,file,commit,chat,decision] [--asc] [--json]` — commits list the
   files they touched
 - `brain status [--json]` — daemon, shell hooks, LLM readiness, database and index state, plus a

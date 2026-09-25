@@ -7,7 +7,11 @@ import { listCommits } from '../dist/core/commits.js';
 import { registerProject } from '../dist/core/projects.js';
 import { backfillHistory, git } from '../dist/git/git.js';
 import { heuristicBrief } from '../dist/summarize/brief.js';
-import { analyzeProjectState, projectStateNarrative } from '../dist/summarize/state.js';
+import {
+  analyzeProjectState,
+  projectImprovementNarrative,
+  projectStateNarrative,
+} from '../dist/summarize/state.js';
 import { hasGit, testDb, tmpDir } from './helpers.ts';
 
 /**
@@ -132,7 +136,11 @@ test('projectStateNarrative says whether work stopped finished or interrupted', 
   assert.match(prose, /\*\*2 unchecked backlog items\*\*/, 'counts the open checklist items');
   assert.match(prose, /documentation says the planned work is finished/, 'reconciles claims with what is left');
   assert.match(prose, /uncommitted/, 'flags work in progress on disk');
-  assert.match(prose, /\*\*The likely next step:\*\*/, 'ends with a concrete next task');
+
+  // "What could come next" comes from the project's own roadmap, attributed.
+  const ideas = projectImprovementNarrative(state);
+  assert.ok(ideas.some((idea) => /email alerts/.test(idea)), `expected the roadmap item: ${ideas}`);
+  assert.ok(ideas.every((idea) => /PROJECT_STATUS\.md/.test(idea)), 'each idea says where it came from');
   db.close();
 });
 
@@ -163,13 +171,14 @@ test('heuristicBrief leads with where the project stands', { skip: !hasGit() }, 
     state,
   } as never);
 
-  assert.match(text, /## Where the project stands/);
-  assert.match(text, /## Where you left off/);
+  assert.match(text, /## What it is/);
+  assert.match(text, /## Where it stands/);
   assert.ok(
-    text.indexOf('## Where the project stands') < text.indexOf('## Where you left off'),
-    'the state section must come first',
+    text.indexOf('## What it is') < text.indexOf('## Where it stands'),
+    'the brief describes the project before its state',
   );
   assert.match(text, /email alerts/);
+  assert.match(text, /## What could come next/);
   db.close();
 });
 
