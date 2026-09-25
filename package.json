@@ -1,0 +1,32 @@
+{
+  "name": "secondbrain",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local-first Second Brain OS: passively captures commands, file touches, git history, decisions and IDE chat, then makes them instantly retrievable.",
+  "type": "module",
+  "bin": {
+    "brain": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsc -p tsconfig.json --watch",
+    "test": "npm run build && node --test test/*.test.ts",
+    "test:fast": "node --test test/*.test.ts",
+    "daemon": "node dist/index.js daemon",
+    "link": "npm run build && npm link"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "chokidar": "^4.0.3",
+    "commander": "^13.1.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.13.1",
+    "typescript": "^5.7.3"
+  }
+}
