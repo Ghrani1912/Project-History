@@ -35,7 +35,11 @@ test('parseGitLog reads hash, author, timestamp, message and numstat totals', ()
   assert.equal(first?.filesChanged, 2);
   assert.equal(first?.insertions, 12);
   assert.equal(first?.deletions, 3);
-  assert.deepEqual(first?.files, ['src/parser.ts', 'assets/logo.png']);
+  // Per-file line counts are what let a brief say *what* changed; binary files report none.
+  assert.deepEqual(first?.files, [
+    { path: 'src/parser.ts', add: 12, del: 3 },
+    { path: 'assets/logo.png', add: 0, del: 0 },
+  ]);
 
   const second = commits[1];
   assert.equal(second?.insertions, 1);
@@ -81,7 +85,8 @@ test('commitStats returns parsed stats for a single commit', { skip: !hasGit() }
   const stats = await commitStats(repo.dir, repo.commits[1] as string);
   assert.ok(stats);
   assert.equal(stats?.filesChanged, 1);
-  assert.equal(stats?.files[0], 'app.ts');
+  assert.equal(stats?.files[0]?.path, 'app.ts');
+  assert.ok((stats?.files[0]?.add ?? 0) > 0, 'the numstat add count should be kept');
 });
 
 test('post-commit hook installs, chains and uninstalls cleanly', { skip: !hasGit() }, () => {

@@ -1,7 +1,11 @@
 export type EventType = 'cmd' | 'file' | 'commit' | 'chat' | 'decision';
 
-/** Things that can be indexed for recall. */
-export type OwnerType = 'decision' | 'commit' | 'chat' | 'event';
+/**
+ * Things that can be indexed for recall. `project` is the per-project overview
+ * document (README, stack, layout), which is what makes "what does this project
+ * do?" answerable instead of returning the vaguest commit message.
+ */
+export type OwnerType = 'decision' | 'commit' | 'chat' | 'event' | 'project';
 
 export interface ProjectRow {
   id: number;

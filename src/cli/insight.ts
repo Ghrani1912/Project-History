@@ -1,21 +1,28 @@
-import fs from 'node:fs';
 import type { Command } from 'commander';
-import { latestBrief } from '../core/briefs.js';
+import { countBriefs, latestBrief } from '../core/briefs.js';
 import { countChatTurns } from '../core/chat.js';
+import { countCommits } from '../core/commits.js';
 import { countDecisions } from '../core/decisions.js';
 import { countEvents, lastEventId } from '../core/events.js';
 import { listProjects, resolveProjectForPath } from '../core/projects.js';
 import { buildTimeline } from '../core/timeline.js';
-import type { TimelineKind } from '../core/types.js';
+import type { ProjectRow, TimelineKind } from '../core/types.js';
 import { generateBrief, shouldAutoBrief } from '../summarize/brief.js';
-import { readDaemonRecord, pingDaemon } from '../capture/client.js';
+import { readDaemonRecord, pingDaemon, request, watchedProjectIds } from '../capture/client.js';
 import { countEmbeddings } from '../embeddings/store.js';
-import { countBriefs } from '../core/briefs.js';
-import { createEmbedder } from '../embeddings/embedder.js';
+import { createEmbedder, hasOllamaModel, listOllamaModels } from '../embeddings/embedder.js';
+import { detectInvokingShell, shellHookFiles, type SupportedShell } from '../capture/shellHook.js';
 import { brainHome, configPath, dbPath } from '../util/paths.js';
-import { formatDay, formatTimestamp, plural, relativeTime, truncate } from '../util/format.js';
+import { formatDay, formatTimestamp, plural, relativeTime, shortPath, truncate } from '../util/format.js';
 import { action, createContext, requireProject, resolveSelectedProject } from './context.js';
 import { c, heading, keyValue, kindBadge, out, printJson, warn } from './output.js';
+
+function renderTimelineDetail(detail: string): void {
+  for (const line of detail.split('\n')) {
+    const text = line.trim();
+    if (text.length > 0) out(`            ${c.grey(truncate(text, 110))}`);
+  }
+}
 
 export function registerInsightCommands(program: Command): void {
   program
@@ -82,7 +89,17 @@ export function registerInsightCommands(program: Command): void {
               return;
             }
             out(generated.text);
-            out(c.grey(`  — ${generated.generator}, watermark event ${generated.watermark}`));
+            out(
+              c.grey(
+                `  — ${generated.generator}, watermark event ${generated.watermark}, generated ${relativeTime(
+                  generated.createdAt,
+                )}`,
+              ),
+            );
+            if (!generated.llm.used && generated.llm.reason) {
+              out(c.grey(`  LLM summary skipped: ${generated.llm.reason}`));
+              out(c.grey('  richer prose needs a local model, e.g.: ollama pull llama3.2'));
+            }
           } finally {
             close();
           }
@@ -129,11 +146,29 @@ export function registerInsightCommands(program: Command): void {
               printJson(ordered);
               return;
             }
+            const names = new Map(listProjects(db, true).map((p) => [p.id, p.name]));
+            const counts = new Map<string, number>();
+            for (const entry of ordered) counts.set(entry.kind, (counts.get(entry.kind) ?? 0) + 1);
+            heading(
+              `${project ? project.name : 'All projects'}${options.days ? ` — last ${options.days} day(s)` : ''}`,
+            );
+            out(
+              c.grey(
+                `  ${plural(ordered.length, 'entry', 'entries')}${
+                  project
+                    ? ` · ${plural(countEvents(db, project.id), 'event')} captured · ${plural(
+                        countCommits(db, project.id),
+                        'commit',
+                      )} · ${plural(countChatTurns(db, project.id), 'chat turn')}`
+                    : ''
+                }`,
+              ),
+            );
             if (ordered.length === 0) {
-              out('Nothing captured yet. Try `brain register` then `brain daemon start`.');
+              out('');
+              warn('nothing captured for this range — see `brain status` for capture problems');
               return;
             }
-            const names = new Map(listProjects(db, true).map((p) => [p.id, p.name]));
             let currentDay = '';
             for (const entry of ordered) {
               const day = formatDay(entry.ts);
@@ -149,8 +184,17 @@ export function registerInsightCommands(program: Command): void {
                   110,
                 )}`,
               );
-              if (entry.detail) out(`            ${c.grey(truncate(entry.detail, 100))}`);
+              if (entry.detail) renderTimelineDetail(entry.detail);
             }
+            out('');
+            out(
+              c.grey(
+                `  ${[...counts.entries()]
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([kind, n]) => plural(n, kind))
+                  .join(' · ')}`,
+              ),
+            );
             out('');
           } finally {
             close();
@@ -161,7 +205,7 @@ export function registerInsightCommands(program: Command): void {
 
   program
     .command('status')
-    .description('Capture daemon, database and index status')
+    .description('Capture daemon, shell hooks, database and index status')
     .option('--json', 'machine-readable output')
     .action(
       action(async (options: { json?: boolean }) => {
@@ -171,6 +215,51 @@ export function registerInsightCommands(program: Command): void {
           const running = record ? await pingDaemon(record) : false;
           const projects = listProjects(db);
           const embedder = await createEmbedder(config);
+          const invoking = await detectInvokingShell();
+          const hooks = (['bash', 'zsh', 'powershell'] as SupportedShell[]).map((shell) => ({
+            shell,
+            files: shellHookFiles(shell),
+          }));
+          const hooked = hooks.filter((entry) => entry.files.length > 0);
+
+          let llmReady = false;
+          let llmDetail = 'disabled (heuristic briefs only)';
+          if (config.llm.provider !== 'none') {
+            const models = await listOllamaModels(config.llm.ollamaUrl);
+            llmReady = Boolean(models && hasOllamaModel(models, config.llm.model));
+            llmDetail = models === null
+              ? `${config.llm.model} — Ollama not reachable at ${config.llm.ollamaUrl}`
+              : llmReady
+                ? `${config.llm.model} ready`
+                : `${config.llm.model} not installed — run: ollama pull ${config.llm.model}`;
+          }
+
+          let watched: number[] = [];
+          if (record && running) {
+            const status = await request<unknown>('status', undefined, { record }).catch(() => null);
+            watched = watchedProjectIds(status?.result);
+          }
+
+          const totals = {
+            events: countEvents(db),
+            commits: projects.reduce((sum, project) => sum + countCommits(db, project.id), 0),
+            decisions: countDecisions(db),
+            chatTurns: countChatTurns(db),
+            briefs: countBriefs(db),
+            embeddings: countEmbeddings(db),
+          };
+
+          const problems: string[] = [];
+          if (!running) problems.push('the daemon is not running — nothing is being captured in the background');
+          if (hooked.length === 0) {
+            problems.push('no shell hook installed — commands are not captured. Fix: brain shell install');
+          } else if (invoking && !hooked.some((entry) => entry.shell === invoking)) {
+            problems.push(`this shell (${invoking}) has no hook — commands typed here are not captured`);
+          }
+          if (!llmReady && config.llm.provider !== 'none') {
+            problems.push(`the LLM summary is unavailable (${llmDetail}) — briefs stay deterministic`);
+          }
+
           const payload = {
             home: brainHome(),
             database: dbPath(),
@@ -180,56 +269,79 @@ export function registerInsightCommands(program: Command): void {
               pid: record?.pid ?? null,
               port: record?.port ?? null,
               startedAt: record?.startedAt ?? null,
+              watched,
             },
             projects: projects.length,
-            events: countEvents(db),
-            decisions: countDecisions(db),
-            chatTurns: countChatTurns(db),
-            briefs: countBriefs(db),
-            embeddings: countEmbeddings(db),
-            embedder: embedder.model,
+            ...totals,
             lastEventId: lastEventId(db),
-            llm: config.llm.provider === 'none' ? 'disabled' : `${config.llm.provider} (${config.llm.model})`,
-            shellHook: fs.existsSync(configPath()),
+            embedder: embedder.model,
+            llm: { provider: config.llm.provider, model: config.llm.model, ready: llmReady, detail: llmDetail },
+            shells: { invoking, hooks },
+            problems,
           };
           if (options.json) {
             printJson(payload);
             return;
           }
+
           heading('Second Brain status');
           keyValue('home', payload.home);
-          keyValue('database', payload.database);
+          keyValue(
+            'database',
+            `${payload.database} ${c.grey(`(${plural(payload.projects, 'project')})`)}`,
+          );
           keyValue(
             'daemon',
             running
-              ? `${c.green('running')} pid ${record?.pid} on 127.0.0.1:${record?.port} (up ${record ? relativeTime(record.startedAt) : '?'})`
+              ? `${c.green('running')} pid ${record?.pid} on 127.0.0.1:${record?.port} ${c.grey(
+                  `(up ${record ? relativeTime(record.startedAt) : '?'}${watched.length > 0 ? `, watching ${watched.length}` : ''})`,
+                )}`
               : c.yellow('not running') + c.grey('  — start with `brain daemon start`'),
           );
-          keyValue('projects', projects.length);
-          keyValue('events', countEvents(db));
-          keyValue('decisions', payload.decisions);
-          keyValue('chat turns', payload.chatTurns);
-          keyValue('briefs', payload.briefs);
-          keyValue('embeddings', `${payload.embeddings} (${payload.embedder})`);
-          keyValue('llm', payload.llm);
+          keyValue('events', totals.events);
+          keyValue('commits', totals.commits);
+          keyValue('decisions', totals.decisions);
+          keyValue('chat turns', totals.chatTurns);
+          keyValue('briefs', totals.briefs);
+          keyValue('embeddings', `${totals.embeddings} (${payload.embedder})`);
+          keyValue('llm', llmReady ? c.green(llmDetail) : c.yellow(llmDetail));
+          keyValue(
+            'shell hooks',
+            hooked.length > 0
+              ? `${c.green(hooked.map((entry) => entry.shell).join(', '))}${invoking ? c.grey(` (this shell: ${invoking})`) : ''}`
+              : c.yellow('none') + c.grey('  — fix with `brain shell install`'),
+          );
+
           if (projects.length > 0) {
             out('');
             heading('Projects');
             for (const project of projects.slice(0, 10)) {
-              out(
-                `  ${c.bold(project.name.padEnd(20))} ${plural(countEvents(db, project.id), 'event')} · ${relativeTime(
-                  project.last_seen_at ?? project.created_at,
-                )}`,
-              );
+              printProjectLine(db, project, watched);
             }
           }
-          if (!running) {
+
+          if (problems.length > 0) {
             out('');
-            warn('the daemon is not running — shell commands, file touches and commits are not being captured');
+            heading('Needs attention');
+            for (const problem of problems) warn(problem);
           }
         } finally {
           close();
         }
       }),
     );
+}
+
+function printProjectLine(db: ReturnType<typeof createContext>['db'], project: ProjectRow, watched: number[]): void {
+  const bits: string[] = [];
+  if (project.stack) bits.push(project.stack);
+  bits.push(plural(countEvents(db, project.id), 'event'));
+  bits.push(plural(countCommits(db, project.id), 'commit'));
+  bits.push(plural(countDecisions(db, project.id), 'decision'));
+  out(`  ${c.bold(project.name.padEnd(18))} ${c.grey(bits.join(' · '))}`);
+  out(
+    `  ${' '.repeat(18)} ${c.grey(shortPath(project.path, 66))} ${
+      watched.includes(project.id) ? c.green('watched') : c.grey('not watched')
+    } ${c.grey(`· last activity ${relativeTime(project.last_seen_at ?? project.created_at)}`)}`,
+  );
 }

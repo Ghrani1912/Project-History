@@ -1,6 +1,57 @@
 import type { Db } from '../db/index.js';
 import type { CommitRow } from './types.js';
 
+/** One file inside a commit, with the lines it contributed. */
+export interface CommitFile {
+  path: string;
+  add: number;
+  del: number;
+}
+
+/**
+ * Read the `files` column.
+ *
+ * Accepts the object shape (`{path, add, del}`) and the older array-of-paths
+ * shape, so databases created before per-file line counts existed keep working.
+ */
+export function parseCommitFiles(raw: string | null | undefined): CommitFile[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    const out: CommitFile[] = [];
+    for (const entry of parsed) {
+      if (typeof entry === 'string') {
+        out.push({ path: entry, add: 0, del: 0 });
+        continue;
+      }
+      if (entry && typeof entry === 'object') {
+        const record = entry as Record<string, unknown>;
+        if (typeof record.path === 'string') {
+          out.push({
+            path: record.path,
+            add: typeof record.add === 'number' ? record.add : 0,
+            del: typeof record.del === 'number' ? record.del : 0,
+          });
+        }
+      }
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
+export function serializeCommitFiles(
+  files: Array<string | CommitFile> | null | undefined,
+): string | null {
+  if (!files || files.length === 0) return null;
+  const normalized: CommitFile[] = files.map((file) =>
+    typeof file === 'string' ? { path: file, add: 0, del: 0 } : file,
+  );
+  return JSON.stringify(normalized);
+}
+
 export interface CommitInput {
   projectId: number;
   hash: string;
@@ -9,7 +60,7 @@ export interface CommitInput {
   filesChanged?: number;
   insertions?: number;
   deletions?: number;
-  files?: string[] | null;
+  files?: Array<string | CommitFile> | null;
   ts: number;
 }
 
@@ -22,7 +73,7 @@ export function upsertCommit(db: Db, commit: CommitInput): UpsertResult {
   const existing = db
     .prepare('SELECT id FROM commits WHERE project_id = ? AND hash = ?')
     .get(commit.projectId, commit.hash) as { id: number } | undefined;
-  const filesJson = commit.files ? JSON.stringify(commit.files) : null;
+  const filesJson = serializeCommitFiles(commit.files);
   if (existing) {
     db.prepare(
       `UPDATE commits

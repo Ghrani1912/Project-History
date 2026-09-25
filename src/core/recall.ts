@@ -21,6 +21,15 @@ export interface AskResult {
   embedderModel: string;
   lexicalCount: number;
   vectorCount: number;
+  /** Best cosine score seen, for judging how trustworthy semantic-only answers are. */
+  bestVectorScore: number;
+  /** How many candidates each retrieval strategy contributed, by owner type. */
+  ownerTypes: Record<string, number>;
+  /**
+   * True when nothing matched lexically and semantic similarity is weak, i.e.
+   * the results are probably just vaguely-related recent items.
+   */
+  weak: boolean;
 }
 
 interface Candidate {
@@ -103,6 +112,7 @@ export async function ask(db: Db, embedder: Embedder, query: string, options: As
   const embeddingScope = projectScope.length > 0 ? null : undefined;
   const scopeIds = projectScope.length > 0 ? new Set(projectScope) : null;
   let vectorCount = 0;
+  let bestVectorScore = 0;
   try {
     const [queryVector] = await embedder.embed([query]);
     if (queryVector) {
@@ -115,6 +125,7 @@ export async function ask(db: Db, embedder: Embedder, query: string, options: As
         if (record.ts < since) continue;
         if (scopeIds && (record.projectId === null || !scopeIds.has(record.projectId))) continue;
         const score = cosineSimilarity(queryVector, record.vector);
+        if (score > bestVectorScore) bestVectorScore = score;
         if (score > 0.05) scored.push({ record, score });
       }
       scored.sort((a, b) => b.score - a.score);
@@ -172,12 +183,18 @@ export async function ask(db: Db, embedder: Embedder, query: string, options: As
   }
   hits.sort((a, b) => b.score - a.score || b.ts - a.ts);
 
+  const ownerTypes: Record<string, number> = {};
+  for (const hit of hits) ownerTypes[hit.ownerType] = (ownerTypes[hit.ownerType] ?? 0) + 1;
+
   return {
     query,
     hits: hits.slice(0, limit),
     embedderModel: embedder.model,
     lexicalCount,
     vectorCount,
+    bestVectorScore,
+    ownerTypes,
+    weak: lexicalCount === 0 && bestVectorScore < 0.55,
   };
 }
 

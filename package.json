@@ -1,6 +1,6 @@
 {
   "name": "secondbrain",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Local-first Second Brain OS: passively captures commands, file touches, git history, decisions and IDE chat, then makes them instantly retrievable.",
   "type": "module",

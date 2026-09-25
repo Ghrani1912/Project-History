@@ -4,13 +4,18 @@ import type { Command } from 'commander';
 import { allAdapters, runAdapters } from '../adapters/index.js';
 import { DEFAULT_CONFIG, loadConfig, saveConfig } from '../config.js';
 import { buildTimeline } from '../core/timeline.js';
-import { listProjects } from '../core/projects.js';
+import { indexProjectCommits, makeIndexer } from '../capture/ingest.js';
+import { countEvents } from '../core/events.js';
+import { buildProjectProfile } from '../summarize/profile.js';
+import { setProjectMeta, getProject, listProjects } from '../core/projects.js';
 import { rebuildIndex } from '../core/recall.js';
-import { makeIndexer } from '../capture/ingest.js';
+import { hasOllamaModel, listOllamaModels } from '../embeddings/embedder.js';
+import { defaultShells, detectInvokingShell, shellHookFiles } from '../capture/shellHook.js';
 import { openDatabase, wipeData } from '../db/index.js';
 import { dbPath, configPath, brainHome } from '../util/paths.js';
 import { action, createContext, getEmbedder } from './context.js';
 import { bullet, c, heading, keyValue, ok, out, printJson, warn } from './output.js';
+import { plural, truncate } from '../util/format.js';
 
 export function registerMaintenanceCommands(program: Command): void {
   program
@@ -215,9 +220,10 @@ export function registerMaintenanceCommands(program: Command): void {
         let dbDetail = dbFile;
         try {
           const db = openDatabase();
-          const row = db.prepare('SELECT COUNT(*) AS n FROM projects').get() as { n: number };
+          // Count real projects only: the synthetic global:// bucket is not one.
+          const n = listProjects(db).length;
           dbOk = true;
-          dbDetail = `${dbFile} (${row.n} project(s))`;
+          dbDetail = `${dbFile} (${plural(n, 'project')})`;
           db.close();
         } catch (err) {
           dbDetail = String(err);
@@ -232,10 +238,35 @@ export function registerMaintenanceCommands(program: Command): void {
               ? `${embedder.model} (Ollama reachable)`
               : `${embedder.model} — Ollama unavailable, offline fallback in use`,
         });
+        // The model has to actually be pulled, otherwise every brief silently
+        // degrades to the deterministic summary.
+        if (config.llm.provider === 'none') {
+          checks.push({ name: 'llm', ok: true, detail: 'disabled (heuristic briefs only)' });
+        } else {
+          const models = await listOllamaModels(config.llm.ollamaUrl);
+          const ready = Boolean(models && hasOllamaModel(models, config.llm.model));
+          checks.push({
+            name: 'llm',
+            ok: ready,
+            detail:
+              models === null
+                ? `${config.llm.model} — Ollama not reachable at ${config.llm.ollamaUrl}`
+                : ready
+                  ? `${config.llm.model} ready`
+                  : `${config.llm.model} not installed — run: ollama pull ${config.llm.model}`,
+          });
+        }
+        // Capture is worthless without a hook in the shell you actually type in.
+        const invoking = await detectInvokingShell();
+        const shells = await defaultShells();
+        const hooked = shells.filter((shell) => shellHookFiles(shell).length > 0);
         checks.push({
-          name: 'llm',
-          ok: config.llm.provider !== 'none',
-          detail: config.llm.provider === 'none' ? 'disabled (heuristic briefs only)' : `${config.llm.model}`,
+          name: 'shell hook',
+          ok: hooked.length > 0 && (!invoking || hooked.includes(invoking)),
+          detail:
+            hooked.length === 0
+              ? `none installed — run: brain shell install (shells checked: ${shells.join(', ')})`
+              : `${hooked.join(', ')}${invoking ? ` (this shell: ${invoking})` : ''}`,
         });
         const { readDaemonRecord } = await import('../capture/client.js');
         const record = readDaemonRecord();
@@ -244,7 +275,13 @@ export function registerMaintenanceCommands(program: Command): void {
           ok: Boolean(record),
           detail: record ? `pid ${record.pid} on port ${record.port}` : 'not running',
         });
-        const adapters = allAdapters(createContext().db);
+        const adapterContext = createContext();
+        let adapters: ReturnType<typeof allAdapters> = [];
+        try {
+          adapters = allAdapters(adapterContext.db);
+        } finally {
+          adapterContext.close();
+        }
         checks.push({
           name: 'adapters',
           ok: adapters.length > 0,
@@ -283,15 +320,77 @@ export function registerMaintenanceCommands(program: Command): void {
       keyValue('config', configPath());
       out('');
       heading('Common commands');
-      bullet('brain register                 track the current directory');
+      bullet('brain ui                       local UI: pick a folder, register by clicking');
+      bullet('brain register [path]          track a project + backfill git history');
       bullet('brain daemon start             background capture');
       bullet('brain timeline --days 7        what happened recently');
       bullet('brain ask "why sqlite?"        semantic recall');
       bullet('brain brief                    where you left off');
       bullet('brain log "decided X because Y"  record a decision');
-      bullet('brain ingest-chat --list       available IDE adapters');
+      bullet('brain refresh                  re-scan every project\'s overview');
+      bullet('brain shell status             which shells actually capture commands');
       bullet('brain export                   back up the database');
     });
+
+  program
+    .command('refresh')
+    .description('Re-scan registered projects and rebuild their stored overview documents')
+    .argument('[project]', 'only this project (name, id or path)')
+    .option('--json', 'machine-readable output')
+    .action(
+      action(async (target: string | undefined, options: { json?: boolean }) => {
+        const { db, config, close } = createContext();
+        try {
+          const embedder = await getEmbedder(config);
+          const index = makeIndexer(db, embedder);
+          const projects = target
+            ? [getProject(db, target)].filter((project): project is NonNullable<typeof project> => project !== null)
+            : listProjects(db);
+          if (projects.length === 0) throw new Error(target ? `no project matching "${target}"` : 'no projects registered');
+
+          const reports: Array<{ id: number; name: string; summary: string; stack: string[]; commitsIndexed: number }> =
+            [];
+          for (const project of projects) {
+            const profile = await buildProjectProfile(db, project);
+            setProjectMeta(db, project.id, {
+              stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
+              summary: profile.summary,
+              git_remote: profile.isGitRepo ? profile.gitRemote : null,
+            });
+            await index([
+              {
+                ownerType: 'project',
+                ownerId: project.id,
+                projectId: project.id,
+                ts: Date.now(),
+                text: profile.doc,
+              },
+            ]);
+            const commitsIndexed = await indexProjectCommits(db, index, project.id);
+            reports.push({
+              id: project.id,
+              name: project.name,
+              summary: profile.summary,
+              stack: profile.stack,
+              commitsIndexed,
+            });
+          }
+          if (options.json) {
+            printJson(reports);
+            return;
+          }
+          for (const report of reports) {
+            out(`  ${c.bold(report.name.padEnd(18))} ${plural(report.commitsIndexed, 'commit')} re-indexed`);
+            out(`  ${' '.repeat(18)} ${truncate(report.summary, 140)}`);
+            if (report.stack.length > 0) out(`  ${' '.repeat(18)} ${c.grey(report.stack.join(', '))}`);
+          }
+          ok(`refreshed ${plural(reports.length, 'project')}`);
+          out(c.grey(`  events captured per project: ${projects.map((p) => countEvents(db, p.id)).join(', ')}`));
+        } finally {
+          close();
+        }
+      }),
+    );
 }
 
 async function gitAvailable(): Promise<boolean> {

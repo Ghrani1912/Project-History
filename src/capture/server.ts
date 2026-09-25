@@ -44,7 +44,8 @@ export interface StatusSnapshot {
   pid: number;
   uptimeSeconds: number;
   projects: number;
-  watched: number;
+  /** Project ids the watcher is currently following. */
+  watched: number[];
   events: number;
   commits: number;
   decisions: number;
@@ -225,7 +226,7 @@ export class CaptureServer {
       pid: process.pid,
       uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000),
       projects: listProjects(this.db).length,
-      watched: this.watcher.list().length,
+      watched: this.watcher.list(),
       events: countEvents(this.db),
       commits: countProjectsCommits(this.db),
       decisions: countDecisions(this.db),

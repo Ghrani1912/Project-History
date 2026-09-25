@@ -4,7 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { DEFAULT_CONFIG } from '../dist/config.js';
 import { addDecision, countDecisions, parseDecisionText } from '../dist/core/decisions.js';
-import { upsertCommit } from '../dist/core/commits.js';
+import { parseCommitFiles, serializeCommitFiles, upsertCommit } from '../dist/core/commits.js';
 import { countEvents } from '../dist/core/events.js';
 import { registerProject, resolveProjectForPath, ensureGlobalProject, listProjects } from '../dist/core/projects.js';
 import { ask, rebuildIndex, toFtsQuery } from '../dist/core/recall.js';
@@ -12,7 +12,15 @@ import { buildTimeline, buildTimelineAscending } from '../dist/core/timeline.js'
 import { makeIndexer, recordCommand, recordDecision, recordFileTouch, isNoteworthyCommand } from '../dist/capture/ingest.js';
 import { createHashEmbedder } from '../dist/embeddings/embedder.js';
 import { countEmbeddings } from '../dist/embeddings/store.js';
-import { generateBrief, heuristicBrief, suggestDecisionsFromCommits } from '../dist/summarize/brief.js';
+import {
+  activityNarrative,
+  aggregateChangedFiles,
+  generateBrief,
+  groupAreas,
+  heuristicBrief,
+  isVagueSubject,
+  suggestDecisionsFromCommits,
+} from '../dist/summarize/brief.js';
 import { testDb, tmpDir } from './helpers.ts';
 
 const embedder = createHashEmbedder(256);
@@ -261,6 +269,137 @@ test('heuristicBrief handles an empty project without crashing', () => {
     watermark: 0,
   });
   assert.match(text, /No captured activity yet/);
+});
+
+test('parseCommitFiles reads the object shape and the legacy path array', () => {
+  assert.deepEqual(parseCommitFiles(JSON.stringify([{ path: 'a.ts', add: 3, del: 1 }])), [
+    { path: 'a.ts', add: 3, del: 1 },
+  ]);
+  // Rows written before per-file counts existed stored plain paths.
+  assert.deepEqual(parseCommitFiles(JSON.stringify(['a.ts'])), [{ path: 'a.ts', add: 0, del: 0 }]);
+  assert.deepEqual(parseCommitFiles(null), []);
+  assert.deepEqual(parseCommitFiles('not json'), []);
+  assert.deepEqual(parseCommitFiles(JSON.stringify([{ nope: 1 }, 42, null])), []);
+});
+
+test('serializeCommitFiles normalises paths and round-trips', () => {
+  const json = serializeCommitFiles(['a.ts', { path: 'b.ts', add: 2, del: 5 }]);
+  assert.deepEqual(parseCommitFiles(json), [
+    { path: 'a.ts', add: 0, del: 0 },
+    { path: 'b.ts', add: 2, del: 5 },
+  ]);
+  assert.equal(serializeCommitFiles([]), null);
+  assert.equal(serializeCommitFiles(null), null);
+});
+
+test('groupAreas groups recent work by top-level directory', () => {
+  const commits = [
+    { files: JSON.stringify([{ path: 'backend/api/main.py', add: 10, del: 2 }]) },
+    {
+      files: JSON.stringify([
+        { path: 'backend/realtime/streaming.py', add: 5, del: 5 },
+        { path: 'README.md', add: 1, del: 0 },
+      ]),
+    },
+    { files: JSON.stringify([{ path: 'dashboard/app.js', add: 3, del: 1 }]) },
+  ];
+  const areas = groupAreas(commits as never);
+  assert.deepEqual(
+    areas.map((area) => area.name),
+    ['backend', 'dashboard', 'root files'],
+  );
+  assert.equal(areas[0]?.commits, 2, 'two commits touched backend');
+  assert.equal(areas[0]?.files, 2, 'two distinct files under backend');
+  assert.equal(areas[0]?.add, 15);
+  assert.equal(areas[0]?.del, 7);
+});
+
+test('isVagueSubject flags subjects that describe nothing', () => {
+  for (const vague of ['idk anymore', 'minor change', 'spectral', 'v3 model', 'WIP', '   ']) {
+    assert.equal(isVagueSubject(vague), true, `expected "${vague}" to be vague`);
+  }
+  for (const clear of [
+    'add retry with backoff to the deploy poller',
+    'fix: stop dropping numstat lines on binary files',
+  ]) {
+    assert.equal(isVagueSubject(clear), false, `expected "${clear}" to be descriptive`);
+  }
+});
+
+test('activityNarrative explains the last session in prose', () => {
+  const commits = [
+    {
+      hash: 'a'.repeat(40),
+      message: 'idk anymore',
+      author: 'A',
+      insertions: 40,
+      deletions: 10,
+      files_changed: 2,
+      ts: 1_699_999_000_000,
+      files: JSON.stringify([
+        { path: 'backend/api/main.py', add: 30, del: 5 },
+        { path: 'backend/realtime/streaming.py', add: 10, del: 5 },
+      ]),
+    },
+    {
+      hash: 'b'.repeat(40),
+      message: 'minor change',
+      author: 'A',
+      insertions: 5,
+      deletions: 1,
+      files_changed: 1,
+      ts: 1_699_900_000_000,
+      files: JSON.stringify([{ path: 'dashboard/app.js', add: 5, del: 1 }]),
+    },
+  ] as never;
+  const paragraphs = activityNarrative({
+    project: { id: 1, name: 'threvia', path: '/tmp/threvia' },
+    generatedAt: 1_700_000_000_000,
+    timeline: [],
+    commits,
+    decisions: [],
+    recentCommands: [],
+    recentChat: [],
+    touchedFiles: [],
+    dirtyFiles: [],
+    failingCommands: [],
+    stack: [],
+    testCommand: null,
+    stats: { events: 4, commits: 2, chatTurns: 0, firstTs: null },
+    watermark: 0,
+    changedFiles: aggregateChangedFiles(commits),
+    areas: groupAreas(commits),
+  } as never);
+  const text = paragraphs.join('\n\n');
+  assert.match(text, /You were last active/);
+  assert.match(text, /backend\/api\/main\.py/, 'names the file the last commit touched');
+  assert.match(text, /newest of 2 commits since/);
+  assert.match(text, /Most of that went into \*\*backend\*\*/);
+  assert.match(text, /commit messages are one-liners/, 'says why the brief is reconstructed');
+  assert.match(text, /\*\*Pick up with:\*\*/);
+});
+
+test('heuristicBrief prints the narrative and per-commit line counts', async () => {
+  const dir = tmpDir();
+  const projectPath = path.join(dir, 'project');
+  fs.mkdirSync(projectPath, { recursive: true });
+  const db = testDb(dir);
+  const project = registerProject(db, projectPath).project;
+  upsertCommit(db, {
+    projectId: project.id,
+    hash: 'f'.repeat(40),
+    author: 'Test',
+    message: 'idk',
+    filesChanged: 1,
+    insertions: 12,
+    deletions: 3,
+    files: [{ path: 'src/a.ts', add: 12, del: 3 }],
+    ts: Date.now() - 3 * 3600_000,
+  });
+  const brief = await generateBrief(db, DEFAULT_CONFIG, project, { heuristicOnly: true });
+  assert.match(brief.text, /## Where you left off\nYou were last active/);
+  assert.match(brief.text, /src\/a\.ts \+12\/-3/, 'the commits list shows what the commit changed');
+  db.close();
 });
 
 test('commit messages that state a decision become suggestions', async () => {

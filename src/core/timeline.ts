@@ -1,4 +1,5 @@
 import type { Db } from '../db/index.js';
+import { parseCommitFiles } from './commits.js';
 import { describeEvent } from './events.js';
 import type { ChatTurnRow, CommitRow, DecisionRow, EventRow, TimelineEntry } from './types.js';
 
@@ -8,6 +9,21 @@ export interface TimelineOptions {
   since?: number;
   until?: number;
   kinds?: Array<TimelineEntry['kind']>;
+}
+
+/** Commit detail line: diff size, author and the files it touched. */
+function commitDetail(row: CommitRow): string {
+  const base = `+${row.insertions}/-${row.deletions} in ${row.files_changed} file(s) by ${row.author ?? 'unknown'}`;
+  const files = parseCommitFiles(row.files);
+  if (files.length === 0) return base;
+  // Biggest files first: "what did this commit actually do" at a glance.
+  const ranked = [...files].sort((a, b) => b.add + b.del - (a.add + a.del));
+  const shown = ranked
+    .slice(0, 4)
+    .map((file) => (file.add + file.del > 0 ? `${file.path} +${file.add}/-${file.del}` : file.path))
+    .join(', ');
+  const more = ranked.length > 4 ? `, … ${ranked.length - 4} more` : '';
+  return `${base}\n            ${shown}${more}`;
 }
 
 interface RawTimeline {
@@ -73,7 +89,7 @@ function collect(db: Db, options: TimelineOptions): RawTimeline[] {
         ts: row.ts,
         projectId: row.project_id,
         text: `${row.hash.slice(0, 7)} ${subject}`,
-        detail: `+${row.insertions}/-${row.deletions} in ${row.files_changed} file(s) by ${row.author ?? 'unknown'}`,
+        detail: commitDetail(row),
         source: 'git',
         refId: row.id,
       });

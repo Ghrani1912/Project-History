@@ -7,8 +7,9 @@ import { registerInsightCommands } from './cli/insight.js';
 import { registerDaemonCommands } from './cli/daemon.js';
 import { registerShellCommands } from './cli/shell.js';
 import { registerMaintenanceCommands } from './cli/maintenance.js';
+import { registerUiCommands } from './cli/ui.js';
 
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 export function buildProgram(): Command {
   const program = new Command();
@@ -26,6 +27,7 @@ export function buildProgram(): Command {
   registerDaemonCommands(program);
   registerShellCommands(program);
   registerMaintenanceCommands(program);
+  registerUiCommands(program);
 
   program.configureOutput({
     writeErr: (str) => process.stderr.write(str),

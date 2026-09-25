@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import net from 'node:net';
 import type { BrainConfig } from '../config.js';
-import { daemonFile } from '../util/paths.js';
+import { cliEntryPath, daemonFile } from '../util/paths.js';
 import { log } from '../util/logger.js';
 import type { DaemonRecord, RequestMessage, RequestOp, ResponseMessage } from './protocol.js';
 
@@ -83,9 +83,31 @@ export async function pingDaemon(record?: DaemonRecord, timeoutMs = 800): Promis
   }
 }
 
+/**
+ * Watched project ids from a daemon `status` reply.
+ *
+ * Accepts both shapes on purpose: older daemons reported a *count* here, and a
+ * stale daemon left running across an upgrade is completely normal. Treating a
+ * count as an array used to throw `watched.includes is not a function` and take
+ * the whole status/UI response down with it.
+ */
+export function watchedProjectIds(status: unknown): number[] {
+  const value = (status as { watched?: unknown } | null | undefined)?.watched;
+  if (!Array.isArray(value)) return [];
+  return value.filter((id): id is number => typeof id === 'number');
+}
+
+/** Watched project count, whichever shape the daemon reported. */
+export function watchedProjectCount(status: unknown): number {
+  const value = (status as { watched?: unknown } | null | undefined)?.watched;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  return watchedProjectIds(status).length;
+}
+
 /** Spawn the daemon detached from the current process, logging to daemon.log. */
 export function startDaemonDetached(): void {
-  const entry = process.argv[1];
+  // Must be the CLI entry, not whatever process happens to be importing us.
+  const entry = cliEntryPath();
   if (!entry) throw new Error('cannot determine CLI entry point for autostart');
   const child = spawn(process.execPath, [entry, 'daemon', 'start', '--foreground'], {
     detached: true,

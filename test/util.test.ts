@@ -19,6 +19,14 @@ test('normalizePath translates shell-style drives on Windows', () => {
   assert.equal(normalizePath('/mnt/d/work/project'), 'D:/work/project');
 });
 
+test('normalizePath resolves the Git Bash /tmp mount on Windows', () => {
+  if (process.platform !== 'win32') return;
+  const resolved = normalizePath('/tmp/secondbrain-demo');
+  assert.ok(resolved.endsWith('/secondbrain-demo'), resolved);
+  assert.ok(!resolved.startsWith('C:/tmp/'), `should use the real temp directory, got ${resolved}`);
+  assert.ok(resolved.toLowerCase().includes('temp'), resolved);
+});
+
 test('relativeTime reads naturally', () => {
   const now = Date.now();
   assert.equal(relativeTime(now, now), 'just now');

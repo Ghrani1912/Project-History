@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
-import { upsertCommit, type CommitInput } from '../core/commits.js';
+import { upsertCommit, type CommitFile, type CommitInput } from '../core/commits.js';
 import type { CommitRow, ProjectRow } from '../core/types.js';
 import { log } from '../util/logger.js';
 
@@ -64,7 +64,8 @@ export interface ParsedCommit {
   filesChanged: number;
   insertions: number;
   deletions: number;
-  files: string[];
+  /** Per-file line counts, which is what lets briefs say *what* changed. */
+  files: CommitFile[];
 }
 
 /**
@@ -85,7 +86,7 @@ export function parseGitLog(stdout: string): ParsedCommit[] {
     let insertions = 0;
     let deletions = 0;
     let filesChanged = 0;
-    const files: string[] = [];
+    const files: CommitFile[] = [];
     for (const line of lines) {
       if (line.trim().length === 0) continue;
       const parts = line.split('\t');
@@ -93,10 +94,13 @@ export function parseGitLog(stdout: string): ParsedCommit[] {
       const [added, removed, ...pathParts] = parts;
       const filePath = pathParts.join('\t').trim();
       if (filePath.length === 0) continue;
+      // Binary files report `-` instead of a count.
+      const add = added && added !== '-' ? Number(added) || 0 : 0;
+      const del = removed && removed !== '-' ? Number(removed) || 0 : 0;
       filesChanged++;
-      files.push(filePath);
-      if (added && added !== '-') insertions += Number(added) || 0;
-      if (removed && removed !== '-') deletions += Number(removed) || 0;
+      files.push({ path: filePath, add, del });
+      insertions += add;
+      deletions += del;
     }
     commits.push({
       hash,

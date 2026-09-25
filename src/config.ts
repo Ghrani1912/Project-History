@@ -11,6 +11,10 @@ export interface BrainConfig {
     /** Start the daemon automatically when another CLI command needs it. */
     autostart: boolean;
   };
+  ui: {
+    /** Loopback port `brain ui` serves the local web UI on. */
+    port: number;
+  };
   embedding: {
     provider: EmbeddingProvider;
     model: string;
@@ -51,6 +55,7 @@ export interface BrainConfig {
 export const DEFAULT_CONFIG: BrainConfig = {
   port: 47615,
   daemon: { autostart: true },
+  ui: { port: 47700 },
   embedding: {
     provider: 'auto',
     model: 'nomic-embed-text',

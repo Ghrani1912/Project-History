@@ -1,14 +1,18 @@
+import fs from 'node:fs';
+import type { BrainConfig } from '../config.js';
 import type { Db } from '../db/index.js';
 import type { Embedder } from '../embeddings/embedder.js';
 import { addDecision } from '../core/decisions.js';
 import { insertChatTurn } from '../core/chat.js';
 import { insertEvent } from '../core/events.js';
 import { indexBatch, type IndexInput } from '../core/indexing.js';
-import { registerProject, resolveProjectForPath, touchProject } from '../core/projects.js';
+import { registerProject, resolveProjectForPath, setProjectMeta, touchProject } from '../core/projects.js';
 import type { ProjectRow } from '../core/types.js';
-import { backfillHistory } from '../git/git.js';
+import { backfillHistory, installPostCommitHook, type HookResult } from '../git/git.js';
+import { buildProjectProfile, type ProjectProfile } from '../summarize/profile.js';
 import { normalizePath } from '../util/paths.js';
 import { truncate } from '../util/format.js';
+import { connect, request } from './client.js';
 
 /** Deferred indexing hook so capture paths stay usable without an embedder. */
 export type Indexer = (inputs: IndexInput[]) => Promise<void>;
@@ -258,15 +262,98 @@ export async function recordChatTurn(
   return { id, created, projectId };
 }
 
-/** Register (if needed) + backfill history for a repo, then index its commits. */
+export interface OnboardOptions {
+  /** Cap the number of commits backfilled. */
+  limit?: number;
+  /** Friendly project name override. */
+  name?: string;
+  /** Install the git post-commit hook (default true; ignored outside a repo). */
+  installHook?: boolean;
+  /** When provided, a running daemon is asked to start watching immediately. */
+  config?: BrainConfig;
+}
+
+export interface OnboardResult {
+  project: ProjectRow;
+  created: boolean;
+  profile: ProjectProfile;
+  commitsScanned: number;
+  commitsInserted: number;
+  commitsIndexed: number;
+  profileIndexed: boolean;
+  hook: HookResult | null;
+  watched: boolean;
+  warnings: string[];
+}
+
+/**
+ * The whole "start tracking this folder" flow: register, scan the project,
+ * store its metadata, index it for recall, install the commit hook and tell the
+ * daemon to watch it. Shared by `brain register` and the local UI so both paths
+ * behave identically.
+ */
 export async function onboardProject(
   db: Db,
   index: Indexer,
   projectPath: string,
-  options: { limit?: number; name?: string } = {},
-): Promise<{ project: ProjectRow; created: boolean; commits: number; hookInstalled: boolean }> {
-  const { project, created } = registerProject(db, projectPath, { name: options.name });
+  options: OnboardOptions = {},
+): Promise<OnboardResult> {
+  const normalized = normalizePath(projectPath);
+  if (!fs.existsSync(normalized)) throw new Error(`path does not exist: ${normalized}`);
+  if (fs.statSync(normalized).isFile()) throw new Error(`expected a folder, got a file: ${normalized}`);
+
+  const { project, created } = registerProject(db, normalized, { name: options.name });
   const backfill = await backfillHistory(db, project, { limit: options.limit });
-  await indexProjectCommits(db, index, project.id);
-  return { project, created, commits: backfill.scanned, hookInstalled: false };
+  const profile = await buildProjectProfile(db, project);
+
+  setProjectMeta(db, project.id, {
+    stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
+    summary: profile.summary,
+    git_remote: profile.isGitRepo ? profile.gitRemote : null,
+  });
+
+  const commitsIndexed = await indexProjectCommits(db, index, project.id);
+  await index([
+    {
+      ownerType: 'project',
+      ownerId: project.id,
+      projectId: project.id,
+      ts: Date.now(),
+      text: profile.doc,
+    },
+  ]);
+
+  const warnings: string[] = [];
+  let hook: HookResult | null = null;
+  if (options.installHook !== false) {
+    hook = installPostCommitHook(normalized);
+    if (!hook.installed && hook.reason && hook.reason !== 'not a git repository') {
+      warnings.push(`could not install the post-commit hook: ${hook.reason}`);
+    }
+  }
+
+  let watched = false;
+  if (options.config) {
+    const daemon = await connect(options.config).catch(() => null);
+    if (daemon) {
+      const response = await request('syncWatch', undefined, { record: daemon }).catch(() => null);
+      watched = response?.ok === true;
+    } else {
+      warnings.push('the capture daemon is not running — start it with `brain daemon start`');
+    }
+  }
+
+  const refreshed = db.prepare('SELECT * FROM projects WHERE id = ?').get(project.id) as ProjectRow;
+  return {
+    project: refreshed,
+    created,
+    profile,
+    commitsScanned: backfill.scanned,
+    commitsInserted: backfill.inserted,
+    commitsIndexed,
+    profileIndexed: true,
+    hook,
+    watched,
+    warnings,
+  };
 }

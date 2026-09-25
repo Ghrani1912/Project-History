@@ -117,7 +117,9 @@ export function registerDaemonCommands(program: Command): void {
           }
           heading(`daemon running (pid ${record.pid}, port ${record.port})`);
           const result = (res.result ?? {}) as Record<string, unknown>;
-          for (const [key, value] of Object.entries(result)) keyValue(key, String(value));
+          for (const [key, value] of Object.entries(result)) {
+            keyValue(key, Array.isArray(value) ? value.join(', ') : String(value));
+          }
         } catch (err) {
           if (options.json) printJson({ running: false, error: String(err) });
           else warn(`daemon record exists but the daemon is unreachable: ${String(err)}`);

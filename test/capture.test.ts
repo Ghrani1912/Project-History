@@ -14,6 +14,7 @@ import {
   writeCliShim,
 } from '../dist/capture/shellHook.js';
 import { ProjectWatcher, buildIgnoreMatcher } from '../dist/capture/watcher.js';
+import { watchedProjectCount, watchedProjectIds } from '../dist/capture/client.js';
 import { tmpDir } from './helpers.ts';
 
 test('the shell snippet wires both shells and builds tab-delimited lines', () => {
@@ -61,22 +62,45 @@ test('shell hook install and uninstall are marker-based and idempotent', () => {
   const rc = path.join(dir, '.bashrc');
   fs.writeFileSync(rc, 'export EDITOR=vim\n', 'utf8');
 
-  const install = installShellHook('bash', rc);
-  assert.equal(install.installed, true);
-  assert.equal(shellHookInstalled('bash', rc), true);
-  const content = fs.readFileSync(rc, 'utf8');
-  assert.match(content, /export EDITOR=vim/, 'existing rc content is preserved');
-  assert.ok(content.includes(SHELL_MARKER_START) && content.includes(SHELL_MARKER_END));
+  // Installing also (re)writes the CLI shim, so keep the home in the temp dir:
+  // a test must never touch the real ~/.secondbrain.
+  const previousHome = process.env.SECOND_BRAIN_HOME;
+  process.env.SECOND_BRAIN_HOME = dir;
+  try {
+    const install = installShellHook('bash', rc);
+    assert.equal(install.installed, true);
+    assert.equal(shellHookInstalled('bash', rc), true);
+    const content = fs.readFileSync(rc, 'utf8');
+    assert.match(content, /export EDITOR=vim/, 'existing rc content is preserved');
+    assert.ok(content.includes(SHELL_MARKER_START) && content.includes(SHELL_MARKER_END));
 
-  const again = installShellHook('bash', rc);
-  assert.equal(again.alreadyPresent, true);
-  assert.equal(fs.readFileSync(rc, 'utf8'), content);
+    const again = installShellHook('bash', rc);
+    assert.equal(again.alreadyPresent, true);
+    assert.equal(fs.readFileSync(rc, 'utf8'), content);
 
-  const removed = uninstallShellHook('bash', rc);
-  assert.equal(removed.removed, true);
-  assert.equal(shellHookInstalled('bash', rc), false);
-  assert.match(fs.readFileSync(rc, 'utf8'), /export EDITOR=vim/);
-  assert.equal(uninstallShellHook('bash', rc).removed, false);
+    const removed = uninstallShellHook('bash', rc);
+    assert.equal(removed.removed, true);
+    assert.equal(shellHookInstalled('bash', rc), false);
+    assert.match(fs.readFileSync(rc, 'utf8'), /export EDITOR=vim/);
+    assert.equal(uninstallShellHook('bash', rc).removed, false);
+  } finally {
+    if (previousHome === undefined) delete process.env.SECOND_BRAIN_HOME;
+    else process.env.SECOND_BRAIN_HOME = previousHome;
+  }
+});
+
+test('a daemon status reply is read whether `watched` is ids or a count', () => {
+  // A daemon left running from an older build reports a count here. Treating
+  // that as an array used to throw `watched.includes is not a function` and
+  // killed the whole status response (and so the entire UI dashboard).
+  assert.deepEqual(watchedProjectIds({ watched: [3, 7] }), [3, 7]);
+  assert.deepEqual(watchedProjectIds({ watched: 2 }), []);
+  assert.deepEqual(watchedProjectIds({}), []);
+  assert.deepEqual(watchedProjectIds(null), []);
+  assert.deepEqual(watchedProjectIds({ watched: ['x', 4] }), [4]);
+  assert.equal(watchedProjectCount({ watched: [1, 2, 3] }), 3);
+  assert.equal(watchedProjectCount({ watched: 2 }), 2);
+  assert.equal(watchedProjectCount(undefined), 0);
 });
 
 test('the CLI shim points at the current entry point', () => {

@@ -60,6 +60,8 @@ export function kindBadge(kind: string): string {
       return c.grey('file   ');
     case 'chat':
       return c.yellow('chat   ');
+    case 'project':
+      return c.green('project');
     default:
       return kind.padEnd(8);
   }
