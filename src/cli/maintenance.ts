@@ -326,6 +326,7 @@ export function registerMaintenanceCommands(program: Command): void {
       bullet('brain timeline --days 7        what happened recently');
       bullet('brain ask "why sqlite?"        semantic recall');
       bullet('brain brief                    where you left off');
+      bullet('brain related                  the same problem solved in another project');
       bullet('brain log "decided X because Y"  record a decision');
       bullet('brain refresh                  re-scan every project\'s overview');
       bullet('brain shell status             which shells actually capture commands');

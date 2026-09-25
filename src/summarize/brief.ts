@@ -14,6 +14,13 @@ import { log } from '../util/logger.js';
 import { formatDay, plural, relativeTime, truncate } from '../util/format.js';
 import { buildProjectProfile, type ProjectProfile } from './profile.js';
 import {
+  DEFAULT_MIN_SCORE,
+  explainMatch,
+  findPriorArt,
+  projectFocus,
+  type PriorArtResult,
+} from '../core/priorart.js';
+import {
   analyzeProjectState,
   projectImprovementNarrative,
   projectScopeNarrative,
@@ -84,6 +91,8 @@ export interface BriefData {
   capture?: CaptureHealth;
   /** Where the project stands, read off the repository itself. */
   state?: ProjectState;
+  /** The same problem solved in another registered project. */
+  priorArt?: PriorArtResult;
 }
 
 export interface BriefOptions {
@@ -179,6 +188,18 @@ async function gatherBriefData(db: Db, project: ProjectRow, options: BriefOption
   };
 
   if (options.withHealth !== false) {
+    // Cross-project prior art: did you already solve this shape elsewhere?
+    const focus = projectFocus(db, project.id);
+    if (focus.text.trim().length > 0) {
+      data.priorArt = findPriorArt(db, focus.text, {
+        excludeProjectIds: [project.id],
+        capabilities: focus.capabilities,
+        roles: focus.roles,
+        limit: 3,
+        // A brief should only mention another project when the evidence is real.
+        minScore: DEFAULT_MIN_SCORE * 2,
+      });
+    }
     const hooked: SupportedShell[] = [];
     for (const shell of ['bash', 'zsh', 'powershell'] as SupportedShell[]) {
       if (shellHookFiles(shell).length > 0) hooked.push(shell);
@@ -487,6 +508,22 @@ export function heuristicBrief(data: BriefData): string {
   if (stateProse.length > 0) {
     lines.push('## Where it stands');
     for (const paragraph of stateProse) lines.push(paragraph, '');
+  }
+
+  /* -------- the same problem, already solved in another project -------- */
+  const priorArt = data.priorArt?.matches ?? [];
+  if (priorArt.length > 0) {
+    lines.push('## Solved elsewhere');
+    for (const match of priorArt.slice(0, 2)) {
+      lines.push(
+        `- **${match.projectName}** — \`${match.hash.slice(0, 7)}\` ${truncate(match.subject || '(no message)', 70)}${
+          match.files.length > 0 ? ` (${match.files.slice(0, 2).join(', ')})` : ''
+        }`,
+      );
+      lines.push(`  - matched ${explainMatch(match)}`);
+    }
+    lines.push('_More matches: `brain related` · whole-DB scan: `brain related --all`._');
+    lines.push('');
   }
 
   /* -------- where the project itself says it could go next -------- */

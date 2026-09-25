@@ -4,6 +4,7 @@ import { countChatTurns } from '../core/chat.js';
 import { countCommits } from '../core/commits.js';
 import { countDecisions } from '../core/decisions.js';
 import { countEvents, lastEventId } from '../core/events.js';
+import { crossProjectLinks, explainMatch, findPriorArt, projectFocus } from '../core/priorart.js';
 import { listProjects, resolveProjectForPath } from '../core/projects.js';
 import { buildTimeline } from '../core/timeline.js';
 import type { ProjectRow, TimelineKind } from '../core/types.js';
@@ -195,6 +196,133 @@ export function registerInsightCommands(program: Command): void {
                   .join(' · ')}`,
               ),
             );
+            out('');
+          } finally {
+            close();
+          }
+        },
+      ),
+    );
+
+  program
+    .command('related')
+    .description('Work you already finished elsewhere that is structurally the same problem')
+    .argument('[query]', 'what you are trying to do (defaults to this project\'s recent work)')
+    .option('-p, --project <project>', 'project name, id or path')
+    .option('-g, --global', 'ignore project scope entirely')
+    .option('--cwd <dir>', 'resolve the project from this directory')
+    .option('--all', 'scan every registered project and print the cross-project links')
+    .option('--limit <n>', 'max matches', (v) => Number(v), 5)
+    .option('--json', 'machine-readable output')
+    .action(
+      action(
+        async (
+          query: string | undefined,
+          options: { project?: string; global?: boolean; cwd?: string; all?: boolean; limit: number; json?: boolean },
+        ) => {
+          const { db, close } = createContext();
+          try {
+            if (options.all) {
+              const links = crossProjectLinks(db);
+              if (options.json) {
+                printJson(links);
+                return;
+              }
+              heading('Cross-project links');
+              if (links.length === 0) {
+                warn('no structurally similar work found between your projects yet');
+                out(c.grey('  register more projects or commit more work, then: brain related --all'));
+                return;
+              }
+              out(c.grey('  what each project could borrow from another'));
+              for (const link of links) {
+                const top = link.matches[0];
+                out('');
+                out(
+                  `  ${c.bold(link.fromProjectName)} ${c.grey('→')} ${c.bold(link.toProjectName)} ${c.grey(
+                    `${plural(link.matches.length, 'match', 'matches')}`,
+                  )}`,
+                );
+                if (top) {
+                  out(
+                    `    ${c.grey('closest:')} \`${top.hash.slice(0, 7)}\` ${truncate(top.subject || '(no message)', 70)}`,
+                  );
+                  out(`    ${c.grey(`because: ${explainMatch(top)}`)}`);
+                }
+              }
+              out('');
+              return;
+            }
+
+            const project = resolveSelectedProject(db, { ...options, global: undefined });
+            let text = (query ?? '').trim();
+            let capabilities: string[] | undefined;
+            let roles: string[] | undefined;
+            if (text.length === 0) {
+              if (!project) {
+                throw new Error('give a query, or run from inside a registered project, or pass -p <project>');
+              }
+              const focus = projectFocus(db, project.id);
+              text = focus.text;
+              capabilities = focus.capabilities;
+              roles = focus.roles;
+              if (text.trim().length === 0) {
+                warn(`${project.name} has no commits to work from yet`);
+                return;
+              }
+            }
+
+            const result = findPriorArt(db, text, {
+              limit: options.limit,
+              capabilities,
+              roles,
+              excludeProjectIds: options.global ? [] : project ? [project.id] : [],
+            });
+            if (options.json) {
+              printJson({ ...result, project: project?.name ?? null, explicitQuery: query ?? null });
+              return;
+            }
+
+            heading('Similar work elsewhere');
+            const explicit = (query ?? '').trim().length > 0;
+            const focusBits = [
+              explicit
+                ? `query: ${truncate(query ?? '', 80)}`
+                : project
+                  ? `focus: ${project.name} (recent work)`
+                  : `query: ${truncate(text, 80)}`,
+              capabilities && capabilities.length > 0 ? capabilities.slice(0, 4).join(', ') : null,
+            ].filter((bit): bit is string => bit !== null);
+            out(c.grey(`  ${focusBits.join(' · ')}`));
+            out(
+              c.grey(
+                `  ${plural(result.candidates, 'solved unit')} across ${plural(result.projectsSearched, 'project')}`,
+              ),
+            );
+            if (result.matches.length === 0) {
+              out('');
+              warn('nothing structurally similar in your other projects');
+              out(c.grey('  try a broader phrasing, or --global to include this project'));
+              return;
+            }
+            for (const match of result.matches) {
+              out('');
+              out(
+                `  ${c.bold(match.projectName)} ${c.grey(
+                  `${match.stack.join(' + ') || 'unknown stack'} · ${relativeTime(match.ts)} · score ${match.score}`,
+                )}`,
+              );
+              out(`    \`${match.hash.slice(0, 7)}\` ${truncate(match.subject || '(no message)', 80)}`);
+              if (match.files.length > 0) {
+                out(
+                  `    ${c.grey(
+                    `${match.files.slice(0, 3).join(', ')}${match.insertions + match.deletions > 0 ? ` (+${match.insertions}/-${match.deletions})` : ''}`,
+                  )}`,
+                );
+              }
+              out(`    ${c.grey(`why: ${explainMatch(match)}`)}`);
+              out(`    ${c.grey(`look: brain timeline -p ${match.projectName} --kinds commit`)}`);
+            }
             out('');
           } finally {
             close();

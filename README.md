@@ -106,6 +106,14 @@ merge-sort into one honest timeline.
 - `brain status [--json]` — daemon, shell hooks, LLM readiness, database and index state, plus a
   "needs attention" list when something would silently silence capture
 
+- `brain related [query] [-p project] [--all] [--limit n] [--json]` — cross-project prior art: with no
+  query it takes the current project's recent work as the question and answers with the work you already
+  *finished elsewhere*. Matching is structural, not textual: capability shapes (auth/session,
+  realtime/streaming, data/ingestion…), the role a file plays in its repo (login, session, detector), and
+  rare shared vocabulary — so `src/auth/login.ts` in one project matches `backend/api/auth/login.py` in
+  another. Every match states why it matched. `--all` scans every registered project and prints the links
+  each one could borrow from the others
+
 **Capture**
 - `brain daemon start|stop|restart|status` — the background capture daemon
 - `brain watch [--once]` — foreground file watching with no socket
