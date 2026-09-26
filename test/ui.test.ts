@@ -16,6 +16,14 @@ test('the UI page is one self-contained document with the run token', () => {
   assert.ok(!/<(link|script)[^>]+(src|href)=/i.test(html));
   assert.ok(html.includes('Track a folder'));
   assert.ok(html.includes('Register folder'));
+  // The cross-project prior-art panel is part of the project detail tabs.
+  assert.ok(html.includes("var tabs = ['overview', 'brief', 'related', 'timeline', 'ask']"));
+  assert.ok(html.includes('/api/related?project='));
+  assert.ok(html.includes('Find similar work'));
+  // Pre-flight: the same tab diffs a plan against past decisions and reverts.
+  assert.ok(html.includes('/api/check?project='));
+  assert.ok(html.includes('Check plan'));
+  assert.ok(html.includes('Before you build it'));
 });
 
 /** Pull a few declarations out of the emitted script so they can be unit-tested. */

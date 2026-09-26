@@ -4,7 +4,18 @@ import { countChatTurns } from '../core/chat.js';
 import { countCommits } from '../core/commits.js';
 import { countDecisions } from '../core/decisions.js';
 import { countEvents, lastEventId } from '../core/events.js';
-import { crossProjectLinks, explainMatch, findPriorArt, projectFocus } from '../core/priorart.js';
+import {
+  crossProjectLinks,
+  explainConcept,
+  explainFile,
+  explainMatch,
+  explainProjectMatch,
+  findPriorArt,
+  findRelatedProjects,
+  projectFocus,
+} from '../core/priorart.js';
+import { checkProposal, explainFinding } from '../core/preflight.js';
+import { getProject } from '../core/projects.js';
 import { listProjects, resolveProjectForPath } from '../core/projects.js';
 import { buildTimeline } from '../core/timeline.js';
 import type { ProjectRow, TimelineKind } from '../core/types.js';
@@ -224,30 +235,73 @@ export function registerInsightCommands(program: Command): void {
           try {
             if (options.all) {
               const links = crossProjectLinks(db);
+              // Document-level pairs, so a project with no commits still shows up.
+              const docLinks: Array<{
+                from: string;
+                to: string;
+                why: string;
+                headline: string;
+                score: number;
+                commits: number;
+                concepts: string[];
+              }> = [];
+              const seen = new Set<string>();
+              for (const candidate of listProjects(db)) {
+                for (const related of findRelatedProjects(db, candidate.id).matches) {
+                  const key = [candidate.id, related.projectId].sort((a, b) => a - b).join(':');
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  docLinks.push({
+                    from: candidate.name,
+                    to: related.projectName,
+                    why: explainProjectMatch(related),
+                    headline: related.relation.headline,
+                    score: related.score,
+                    commits: related.commits,
+                    concepts: related.sharedConcepts.slice(0, 4).map(explainConcept),
+                  });
+                }
+              }
               if (options.json) {
-                printJson(links);
+                printJson({ links, projects: docLinks });
                 return;
               }
               heading('Cross-project links');
-              if (links.length === 0) {
+              if (links.length === 0 && docLinks.length === 0) {
                 warn('no structurally similar work found between your projects yet');
                 out(c.grey('  register more projects or commit more work, then: brain related --all'));
                 return;
               }
-              out(c.grey('  what each project could borrow from another'));
-              for (const link of links) {
-                const top = link.matches[0];
-                out('');
-                out(
-                  `  ${c.bold(link.fromProjectName)} ${c.grey('→')} ${c.bold(link.toProjectName)} ${c.grey(
-                    `${plural(link.matches.length, 'match', 'matches')}`,
-                  )}`,
-                );
-                if (top) {
+              if (links.length > 0) {
+                out(c.grey('  what each project could borrow from another'));
+                for (const link of links) {
+                  const top = link.matches[0];
+                  out('');
                   out(
-                    `    ${c.grey('closest:')} \`${top.hash.slice(0, 7)}\` ${truncate(top.subject || '(no message)', 70)}`,
+                    `  ${c.bold(link.fromProjectName)} ${c.grey('→')} ${c.bold(link.toProjectName)} ${c.grey(
+                      `${plural(link.matches.length, 'match', 'matches')}`,
+                    )}`,
                   );
-                  out(`    ${c.grey(`because: ${explainMatch(top)}`)}`);
+                  if (top) {
+                    out(
+                      `    ${c.grey('closest:')} \`${top.hash.slice(0, 7)}\` ${truncate(top.subject || '(no message)', 70)}`,
+                    );
+                    out(`    ${c.grey(`because: ${explainMatch(top)}`)}`);
+                  }
+                }
+              }
+              if (docLinks.length > 0) {
+                out('');
+                heading('Projects that read like each other');
+                out(c.grey('  matched on overview documents, so this works before any commits'));
+                for (const link of docLinks) {
+                  out('');
+                  out(`  ${c.bold(link.from)} ${c.grey('↔')} ${c.bold(link.to)} ${c.grey(`score ${link.score}`)}`);
+                  out(`    ${link.headline}`);
+                  for (const concept of link.concepts) {
+                    out(`    ${c.grey('common:')} ${concept}`);
+                  }
+                  if (link.commits === 0) out(`    ${c.grey('the other side has no commits yet')}`);
                 }
               }
               out('');
@@ -258,6 +312,7 @@ export function registerInsightCommands(program: Command): void {
             let text = (query ?? '').trim();
             let capabilities: string[] | undefined;
             let roles: string[] | undefined;
+            let noCommits = false;
             if (text.length === 0) {
               if (!project) {
                 throw new Error('give a query, or run from inside a registered project, or pass -p <project>');
@@ -266,10 +321,7 @@ export function registerInsightCommands(program: Command): void {
               text = focus.text;
               capabilities = focus.capabilities;
               roles = focus.roles;
-              if (text.trim().length === 0) {
-                warn(`${project.name} has no commits to work from yet`);
-                return;
-              }
+              if (text.trim().length === 0) noCommits = true;
             }
 
             const result = findPriorArt(db, text, {
@@ -278,32 +330,38 @@ export function registerInsightCommands(program: Command): void {
               roles,
               excludeProjectIds: options.global ? [] : project ? [project.id] : [],
             });
+            const relatedProjects = project
+              ? findRelatedProjects(db, project.id, { limit: options.limit })
+              : null;
             if (options.json) {
-              printJson({ ...result, project: project?.name ?? null, explicitQuery: query ?? null });
+              printJson({
+                ...result,
+                project: project?.name ?? null,
+                explicitQuery: query ?? null,
+                relatedProjects: relatedProjects?.matches ?? [],
+              });
               return;
             }
 
-            heading('Similar work elsewhere');
-            const explicit = (query ?? '').trim().length > 0;
-            const focusBits = [
-              explicit
-                ? `query: ${truncate(query ?? '', 80)}`
-                : project
-                  ? `focus: ${project.name} (recent work)`
-                  : `query: ${truncate(text, 80)}`,
-              capabilities && capabilities.length > 0 ? capabilities.slice(0, 4).join(', ') : null,
-            ].filter((bit): bit is string => bit !== null);
-            out(c.grey(`  ${focusBits.join(' · ')}`));
-            out(
-              c.grey(
-                `  ${plural(result.candidates, 'solved unit')} across ${plural(result.projectsSearched, 'project')}`,
-              ),
-            );
-            if (result.matches.length === 0) {
-              out('');
-              warn('nothing structurally similar in your other projects');
-              out(c.grey('  try a broader phrasing, or --global to include this project'));
-              return;
+            let printedSomething = false;
+            if (result.matches.length > 0) {
+              printedSomething = true;
+              heading('Similar work elsewhere');
+              const explicit = (query ?? '').trim().length > 0;
+              const focusBits = [
+                explicit
+                  ? `query: ${truncate(query ?? '', 80)}`
+                  : project
+                    ? `focus: ${project.name} (recent work)`
+                    : `query: ${truncate(text, 80)}`,
+                capabilities && capabilities.length > 0 ? capabilities.slice(0, 4).join(', ') : null,
+              ].filter((bit): bit is string => bit !== null);
+              out(c.grey(`  ${focusBits.join(' · ')}`));
+              out(
+                c.grey(
+                  `  ${plural(result.candidates, 'solved unit')} across ${plural(result.projectsSearched, 'project')}`,
+                ),
+              );
             }
             for (const match of result.matches) {
               out('');
@@ -323,12 +381,136 @@ export function registerInsightCommands(program: Command): void {
               out(`    ${c.grey(`why: ${explainMatch(match)}`)}`);
               out(`    ${c.grey(`look: brain timeline -p ${match.projectName} --kinds commit`)}`);
             }
+
+            // A freshly registered folder has a README but no commits. Rather
+            // than "nothing found", pair it with the projects it reads like.
+            if (relatedProjects && relatedProjects.matches.length > 0) {
+              printedSomething = true;
+              out('');
+              heading('Projects that read like this one');
+              out(
+                c.grey(
+                  `  matched on the overview document, not commits${noCommits ? ' (this project has no commits yet)' : ''}`,
+                ),
+              );
+              for (const related of relatedProjects.matches) {
+                out('');
+                out(
+                  `  ${c.bold(related.projectName)} ${c.grey(
+                    `${related.stack.join(' + ') || 'unknown stack'} · ${plural(related.commits, 'commit')} · score ${related.score}`,
+                  )}`,
+                );
+                if (related.summary.length > 0) out(`    ${truncate(related.summary, 100)}`);
+                out('');
+                out(`    ${related.relation.headline}`);
+                if (related.relation.evidence.length > 0) {
+                  out(`    ${c.grey(`already there in ${related.projectName} — these are the pieces to reuse:`)}`);
+                  for (const item of related.relation.evidence) {
+                    out('');
+                    out(`      ${c.bold(item.idea)}`);
+                    if (item.yours) out(`        ${c.grey(`you say: "${item.yours}"`)}`);
+                    if (item.files.length === 0) {
+                      out(`        ${c.grey('nothing found over there yet')}`);
+                    }
+                    for (const file of item.files) {
+                      out(
+                        `        ${explainFile(file)}${item.source === 'doc' ? c.grey(' (their README)') : ''}`,
+                      );
+                    }
+                  }
+                }
+                out(`    ${c.grey(`catch up: brain timeline -p ${related.projectName}`)}`);
+              }
+            }
+
+            if (!printedSomething) {
+              warn('nothing structurally similar in your other projects');
+              out(
+                c.grey(
+                  noCommits
+                    ? '  this project has no commits yet, and its README does not resemble another project'
+                    : '  try a broader phrasing, or --global to include this project',
+                ),
+              );
+            }
             out('');
           } finally {
             close();
           }
         },
       ),
+    );
+
+  program
+    .command('check')
+    .description('Before you build it: does a past decision already reject or settle this?')
+    .argument('<proposal>', 'what you are about to do, in your own words')
+    .option('-p, --project <project>', 'only consider this project\'s history')
+    .option('--limit <n>', 'max findings', (v) => Number(v), 4)
+    .option('--json', 'machine-readable output')
+    .action(
+      action(async (proposal: string, options: { project?: string; limit: number; json?: boolean }) => {
+        const { db, close } = createContext();
+        try {
+          const project = options.project ? getProject(db, options.project) : null;
+          if (options.project && !project) throw new Error(`no project matching "${options.project}"`);
+          const result = checkProposal(db, proposal, {
+            projectId: project?.id ?? null,
+            limit: options.limit,
+          });
+          if (options.json) {
+            printJson(result);
+            return;
+          }
+
+          heading('Pre-flight check');
+          out(c.grey(`  proposal: ${truncate(proposal, 100)}`));
+          out(
+            c.grey(
+              `  checked ${plural(result.considered, 'past decision', 'past decisions')}${project ? ` in ${project.name}` : ' across every project'}`,
+            ),
+          );
+
+          if (result.findings.length === 0) {
+            out('');
+            if (result.considered === 0) {
+              out(`  ${c.green('clear')} — nothing to compare yet: no decisions logged and no reverts in git.`);
+              out(c.grey('  decisions are what this reads, so: brain log "chose X over Y because Z"'));
+            } else {
+              out(`  ${c.green('clear')} — nothing you logged contradicts this.`);
+              if (result.bestRejectedScore > 0) {
+                out(c.grey(`  (closest unrelated history scored ${result.bestRejectedScore})`));
+              }
+            }
+            return;
+          }
+
+          for (const finding of result.findings) {
+            const when = `${formatDay(finding.ts)} · ${relativeTime(finding.ts)}`;
+            const where = finding.projectName ? ` · ${finding.projectName}` : '';
+            const label = finding.status === 'rejected' ? c.yellow('rejected') : c.green('decided');
+            out('');
+            out(
+              `  ${finding.source === 'revert' ? c.yellow('⚠ git revert') : label} ${c.grey(`${when}${where}`)}`,
+            );
+            out(`    “${truncate(finding.text, 120)}”`);
+            if (finding.reason) out(`    ${c.grey(`because: ${truncate(finding.reason, 140)}`)}`);
+            out(`    ${c.grey(`relevance: ${explainFinding(finding)}`)}`);
+            if (finding.hash) out(`    ${c.grey(`commit ${finding.hash.slice(0, 7)}`)}`);
+          }
+
+          out('');
+          if (result.verdict === 'rejected-before') {
+            warn('you rejected something like this before — read the reason above first');
+          } else if (result.verdict === 'decided-before') {
+            warn('this was already decided — reuse that decision instead of re-deciding it');
+          } else {
+            out(c.grey('  related history only — nothing here rules your proposal in or out'));
+          }
+        } finally {
+          close();
+        }
+      }),
     );
 
   program

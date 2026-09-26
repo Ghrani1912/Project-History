@@ -165,6 +165,11 @@ var briefPending = {};
 var timelineCache = {};
 var timelineInfoCache = {};
 var timelinePending = {};
+var relatedCache = {};
+var relatedPending = {};
+// The pre-flight check is user-typed, so the cache also holds the plan text:
+// the 20s state poll rebuilds this card and would otherwise clear the input.
+var checkCache = {};
 
 function api(url, options) {
   options = options || {};
@@ -305,7 +310,7 @@ function selectProject(id) {
 }
 
 function renderDetail(project) {
-  var tabs = ['overview', 'brief', 'timeline', 'ask'];
+  var tabs = ['overview', 'brief', 'related', 'timeline', 'ask'];
   var head = '<div class="row" style="justify-content:space-between">' +
     '<div><div style="font-weight:700;font-size:15px">' + esc(project.name) + '</div>' +
     '<div class="muted mono" style="font-size:12px">' + esc(project.path) + '</div></div>' +
@@ -318,6 +323,7 @@ function renderDetail(project) {
   var body = '';
   if (tab === 'overview') body = overviewHtml(project);
   else if (tab === 'brief') body = briefHtml(project);
+  else if (tab === 'related') body = relatedHtml(project);
   else if (tab === 'timeline') body = timelineHtml(project);
   else body = askHtml(project);
   put('detail', head + body);
@@ -325,6 +331,17 @@ function renderDetail(project) {
     if (briefCache[project.id]) put('briefBody', briefCache[project.id]);
     else if (briefPending[project.id]) put('briefBody', '<span class="spin">Generating…</span>');
     else loadBrief(project.id, false);
+  }
+  if (tab === 'related') {
+    if (relatedCache[project.id]) put('relatedBody', relatedCache[project.id]);
+    else if (relatedPending[project.id]) put('relatedBody', '<span class="spin">Searching…</span>');
+    else loadRelated(project.id, false);
+    var checked = checkCache[project.id];
+    if (checked) {
+      put('checkBody', checked.html);
+      var checkBox = el('checkInput');
+      if (checkBox) checkBox.value = checked.plan;
+    }
   }
   if (tab === 'timeline') {
     if (timelineCache[project.id]) {
@@ -382,6 +399,178 @@ function loadBrief(id, ai) {
   }).catch(function (err) {
     delete briefPending[id];
     put('briefBody', '<span class="bad">' + esc(err.message) + '</span>');
+  });
+}
+
+function relatedHtml(project) {
+  return '<div class="row"><button class="primary" data-project="' + project.id +
+    '" onclick="relatedFromButton(this)">Find similar work</button>' +
+    '<label class="muted" style="font-size:12px"><input type="checkbox" id="relatedSelf"> include this project too</label></div>' +
+    '<div class="spacer"></div><div id="relatedBody" class="muted">Looks for the same problem already solved in your ' +
+    '<b>other</b> projects, matching the shape of the problem and the role each file plays — not file names.</div>' +
+    '<div class="report"><div style="font-weight:600;font-size:13px">Before you build it</div>' +
+    '<div class="muted" style="font-size:12px;margin:4px 0 8px">Diffs a plan against every decision you have logged ' +
+    'and every revert in your git history, so you hear about your own past "no" now instead of after the work.</div>' +
+    '<div class="row"><input type="text" id="checkInput" data-project="' + project.id +
+    '" placeholder="add redis caching for the session lookup path" onkeydown="checkOnEnter(event)">' +
+    '<button class="primary" data-project="' + project.id +
+    '" onclick="checkFromButton(this)">Check plan</button></div>' +
+    '<div class="spacer"></div><div id="checkBody" class="muted" style="font-size:12px">' +
+    'It also answers from the CLI: <code>brain check "add redis caching for the session lookup path"</code></div></div>';
+}
+
+function checkFromButton(button) { runCheck(Number(button.getAttribute('data-project'))); }
+function checkOnEnter(event) {
+  if (event.key === 'Enter') runCheck(Number(event.target.getAttribute('data-project')));
+}
+
+function checkHtml(data) {
+  if (data.verdict === 'clear') {
+    if (data.considered === 0) {
+      return '<div><b class="ok">clear</b> — nothing to compare yet: no decisions logged and no reverts ' +
+        'in git. Decisions are what this reads, so <code>brain log "chose X over Y because Z"</code> is ' +
+        'what makes it useful.</div>';
+    }
+    return '<div><b class="ok">clear</b> — nothing you logged contradicts this. Checked ' + data.considered +
+      ' past decisions across ' + esc(data.scope) + '.</div>';
+  }
+  var head = data.verdict === 'rejected-before'
+    ? '<b class="bad">you rejected something like this before — read the reason first</b>'
+    : data.verdict === 'decided-before'
+      ? '<b class="warn">already decided</b> — reuse that decision instead of re-deciding it'
+      : '<b class="muted">related history only</b> — nothing here rules the plan in or out';
+  var html = '<div>' + head + '<span class="muted" style="font-size:12px"> · ' + data.considered +
+    ' past decisions checked across ' + esc(data.scope) + '</span></div>';
+  html += data.findings.map(function (finding) {
+    var rejected = finding.source === 'revert' || finding.status === 'rejected';
+    var label = finding.source === 'revert' ? 'git revert' : rejected ? 'rejected' : 'decided';
+    var tint = rejected ? 'var(--yellow)' : 'var(--green)';
+    return '<div class="entry-line"><div><span class="tag" style="color:' + tint + '">' + esc(label) +
+      '</span> ' + (finding.project ? '<span class="badge project">' + esc(finding.project) + '</span> ' : '') +
+      '<span class="t">' + rel(finding.ts) + '</span></div>' +
+      '<div class="mono">' + esc(finding.text) + '</div>' +
+      (finding.reason ? '<div class="muted" style="font-size:12px">because: ' + esc(finding.reason) + '</div>' : '') +
+      '<div class="muted" style="font-size:12px">relevance: ' + esc(finding.why) +
+      (finding.hash ? ' · commit ' + esc(finding.hash) : '') + '</div></div>';
+  }).join('');
+  return html;
+}
+
+function runCheck(id) {
+  var box = el('checkInput');
+  var plan = box ? box.value.trim() : '';
+  if (!plan) {
+    put('checkBody', '<span class="bad">Type what you are about to build first.</span>');
+    return;
+  }
+  put('checkBody', '<span class="spin">Comparing against your past decisions…</span>');
+  api('/api/check?project=' + id + '&q=' + encodeURIComponent(plan)).then(function (data) {
+    var html = checkHtml(data);
+    checkCache[id] = { plan: plan, html: html };
+    put('checkBody', html);
+  }).catch(function (err) {
+    put('checkBody', '<span class="bad">' + esc(err.message) + '</span>');
+  });
+}
+
+function relatedFromButton(button) { loadRelated(Number(button.getAttribute('data-project')), true); }
+
+function relatedProjectEntry(match) {
+  var bits = [];
+  bits.push('<div class="entry-line"><span class="badge project">' + esc(match.project) + '</span> ' +
+    '<span class="muted" style="font-size:12px">' + esc(match.commits + ' commit(s)') + '</span>' +
+    (match.stack && match.stack.length ? ' <span class="muted" style="font-size:12px">· ' + esc(match.stack.join(' + ')) + '</span>' : '') +
+    ' <span class="muted" style="font-size:12px">· score ' + esc(String(match.score)) + '</span>');
+  if (match.summary) {
+    bits.push('<div class="muted" style="font-size:12px">' + esc(match.summary.slice(0, 160)) + '</div>');
+  }
+  var relation = match.relation;
+  if (relation && relation.headline) {
+    bits.push('<div style="font-size:12px;margin-top:4px">' + esc(relation.headline) + '</div>');
+  }
+  var evidence = (relation && relation.evidence) || [];
+  if (evidence.length) {
+    bits.push('<div class="muted" style="font-size:12px;margin-top:2px">Already there in <b>' + esc(match.project) + '</b> — these are the pieces to reuse:</div>');
+    evidence.forEach(function (concept) {
+      var files = concept.files || [];
+      bits.push('<div style="font-size:12px;margin:6px 0 0 8px">' +
+        '<b>' + esc(concept.idea || concept.term) + '</b>');
+      if (concept.yours) {
+        bits.push('<div class="muted" style="font-size:12px">you say: “' + esc(concept.yours) + '”</div>');
+      }
+      if (files.length === 0) {
+        bits.push('<div class="muted" style="font-size:12px">nothing found over there yet</div>');
+      }
+      files.forEach(function (file) {
+        bits.push('<div class="mono" style="font-size:12px">' + esc(file.summary || file.path) +
+          (concept.source === 'doc' ? ' <span class="muted">(their README)</span>' : '') + '</div>');
+      });
+      bits.push('</div>');
+    });
+  }
+  bits.push('<div class="muted" style="font-size:12px">why: ' + esc(match.why || '') + '</div>');
+  bits.push('<div class="muted" style="font-size:12px">catch up: <code>' + esc(match.timeline) + '</code></div>');
+  bits.push('</div>');
+  return bits.join('');
+}
+
+function relatedEntry(match) {
+  var bits = [];
+  bits.push('<div class="entry-line"><span class="badge project">' + esc(match.project) + '</span> ' +
+    '<span class="mono">' + esc(match.hash) + '</span> ' + esc(match.subject) +
+    (match.url ? ' <a href="' + attr(match.url) + '" target="_blank" rel="noreferrer">open ↗</a>' : ''));
+  bits.push('<div class="muted" style="font-size:12px">' + rel(match.ts) +
+    (match.stack && match.stack.length ? ' · ' + esc(match.stack.join(' + ')) : '') +
+    ' · score ' + esc(String(match.score)) + '</div>');
+  if (match.files && match.files.length) {
+    bits.push('<div class="muted mono" style="font-size:12px">' + esc(match.files.join(', ')) +
+      (match.insertions + match.deletions > 0 ? esc(' (+' + match.insertions + '/-' + match.deletions + ')') : '') +
+      '</div>');
+  }
+  bits.push('<div class="muted" style="font-size:12px">why: ' + esc(match.why || '') + '</div>');
+  bits.push('<div class="muted" style="font-size:12px">history: ' +
+    '<code>brain timeline -p ' + esc(match.project) + '</code></div>');
+  bits.push('</div>');
+  return bits.join('');
+}
+
+function loadRelated(id) {
+  relatedPending[id] = true;
+  var box = el('relatedSelf');
+  var self = box && box.checked ? '1' : '0';
+  put('relatedBody', '<span class="spin">Searching your other projects…</span>');
+  api('/api/related?project=' + id + '&self=' + self + '&limit=8').then(function (data) {
+    var html = '';
+    var projects = data.projects || [];
+    var matches = data.matches || [];
+    if (projects.length) {
+      html += '<div style="font-weight:600;font-size:13px">Related projects</div>' +
+        '<div class="muted" style="font-size:12px">' + projects.length +
+        ' other project(s) whose overview reads like this one' +
+        (data.commitsIndexed === 0 ? ' — matched on the README, since no commits are indexed here yet' : '') +
+        ':</div>' + projects.map(relatedProjectEntry).join('');
+    }
+    if (matches.length) {
+      html += '<div class="spacer"></div><div class="muted" style="font-size:12px">' + matches.length +
+        ' solved-work matches from ' + data.projectsSearched + ' other project(s), drawn from ' + data.candidates +
+        ' solved commits' + (data.focus && data.focus.capabilities.length ? ' · focus: ' + esc(data.focus.capabilities.slice(0, 4).join(', ')) : '') +
+        '</div>';
+      html += matches.map(relatedEntry).join('');
+    }
+    if (!projects.length && !matches.length) {
+      html = data.commitsIndexed === 0
+        ? '<span class="muted">No commits indexed for this project yet, so there is no solved work to compare. ' +
+          'Its README does not resemble another project either. Run <code>brain refresh</code> after your first commit, ' +
+          'or register another repo (<code>brain register &lt;path&gt;</code>).</span>'
+        : '<span class="muted">Nothing similar in your other projects yet. Register another repo ' +
+          '(<code>brain register &lt;path&gt;</code>) and this list fills itself.</span>';
+    }
+    delete relatedPending[id];
+    relatedCache[id] = html;
+    put('relatedBody', html);
+  }).catch(function (err) {
+    delete relatedPending[id];
+    put('relatedBody', '<span class="bad">' + esc(err.message) + '</span>');
   });
 }
 

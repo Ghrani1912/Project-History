@@ -106,13 +106,24 @@ merge-sort into one honest timeline.
 - `brain status [--json]` — daemon, shell hooks, LLM readiness, database and index state, plus a
   "needs attention" list when something would silently silence capture
 
+- `brain check "<proposal>" [-p project] [--limit n] [--json]` — pre-flight a decision before you commit
+  to it. Semantic-diffs what you are about to do against every logged decision *and* every `Revert "..."`
+  commit, separating what you accepted from what you rejected, and repeats the reason you recorded:
+  *"you rejected something like this in March because the write path bypassed the cache"*. Verdicts:
+  `rejected-before`, `decided-before`, `related`, `clear`
 - `brain related [query] [-p project] [--all] [--limit n] [--json]` — cross-project prior art: with no
   query it takes the current project's recent work as the question and answers with the work you already
   *finished elsewhere*. Matching is structural, not textual: capability shapes (auth/session,
   realtime/streaming, data/ingestion…), the role a file plays in its repo (login, session, detector), and
   rare shared vocabulary — so `src/auth/login.ts` in one project matches `backend/api/auth/login.py` in
-  another. Every match states why it matched. `--all` scans every registered project and prints the links
-  each one could borrow from the others
+  another. A project with no commits yet is still matched on its **overview document** (README + summary),
+  so a freshly registered folder that reads like an existing project shows up immediately. The match states
+  the relation in prose — *"Test and Threvia are the same shape of system: both model relationships as a
+  graph…"* — then quotes your own README as evidence for each idea in common and **opens the file it already
+  lives in over there** to report the reusable pieces: *"bloom filter — you say: 'a Bloom Filter for instant
+  blacklist lookups' — backend/realtime/bloom_filter.py — Python, 238 lines · defines ThreatBloomFilter,
+  build_from_dataset, check, add · 'Phase 4A — Bloom Filter'"*. `--all` scans every registered project and
+  prints the links each one could borrow from the others, plus the pairs whose overviews read alike
 
 **Capture**
 - `brain daemon start|stop|restart|status` — the background capture daemon
@@ -178,8 +189,14 @@ opens it in your browser. It exists so you never have to remember the order of `
   actionable ("your powershell shell has no hook — commands typed there are not captured").
 - **Projects** — every project with its stored summary, stack, counts and watch state.
 - **Per project** — *Overview* (what is stored on the row), *Brief* (regenerate, optionally with the
-  local LLM), *Timeline* (1d/7d/30d/1y with the files each commit touched), *Ask* (hybrid recall
-  with lexical/vector candidate counts and an honest warning when the results are semantic near-misses).
+  local LLM), *Related* (*Related projects* matched on the overview README even before any commit — a
+  headline saying how the two projects relate, then each shared idea with your own words quoted and, for the
+  files it lives in on the other side, what is actually inside them (language, line count, the definitions it
+  exports, its own docstring) — then the same work already finished in another project, each match linking to
+  its commit, plus **Before you build it** — type a plan and it diffs it against your logged decisions and
+  every `Revert "..."` commit, repeating the reason you recorded), *Timeline* (1d/7d/30d/1y with the
+  files each commit touched), *Ask* (hybrid recall with lexical/vector candidate counts and an honest
+  warning when the results are semantic near-misses).
 
 Mutations are gated by a random per-run token embedded in the page, so another website cannot drive
 the loopback API. Nothing is uploaded: the page has no external assets at all.

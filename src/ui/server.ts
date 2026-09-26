@@ -16,6 +16,31 @@ import { ask } from '../core/recall.js';
 import { buildTimeline } from '../core/timeline.js';
 import type { ProjectRow } from '../core/types.js';
 import {
+  DEFAULT_MIN_SCORE,
+  crossProjectLinks,
+  explainFile,
+  explainMatch,
+  explainProjectMatch,
+  findPriorArt,
+  findRelatedProjects,
+  projectFocus,
+  type PriorArtMatch,
+  type RelatedProject,
+} from '../core/priorart.js';
+import { checkProposal, explainFinding } from '../core/preflight.js';
+
+/** Deep link to a commit when the project has a hosting remote we understand. */
+export function commitUrl(remote: string | null, hash: string): string | null {
+  if (!remote) return null;
+  const github = remote.match(/github\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (github) return `https://github.com/${github[1]}/${github[2]}/commit/${hash}`;
+  const gitlab = remote.match(/gitlab\.com[:/]+([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (gitlab) return `https://gitlab.com/${gitlab[1]}/${gitlab[2]}/-/commit/${hash}`;
+  const bitbucket = remote.match(/bitbucket\.org[:/]+([^/]+)\/([^/]+?)(?:\.git)?$/i);
+  if (bitbucket) return `https://bitbucket.org/${bitbucket[1]}/${bitbucket[2]}/commits/${hash}`;
+  return null;
+}
+import {
   connect,
   pingDaemon,
   readDaemonRecord,
@@ -204,6 +229,12 @@ export class BrainUiServer {
         return;
       case 'GET /api/brief':
         this.sendJson(res, 200, await this.brief(url));
+        return;
+      case 'GET /api/related':
+        this.sendJson(res, 200, this.related(url));
+        return;
+      case 'GET /api/check':
+        this.sendJson(res, 200, this.check(url));
         return;
       case 'GET /api/ask':
         this.sendJson(res, 200, await this.ask(url));
@@ -514,6 +545,130 @@ export class BrainUiServer {
       generator: generated.generator,
       llm: generated.llm,
       createdAt: generated.createdAt,
+    };
+  }
+
+  /** Cross-project prior art: the same problem solved in another project. */
+  private related(url: URL): Record<string, unknown> {
+    if (url.searchParams.get('all') === '1' && !url.searchParams.get('project')) {
+      const links = crossProjectLinks(this.db);
+      return {
+        scope: 'everything',
+        links: links.map((link) => ({
+          from: link.fromProjectName,
+          to: link.toProjectName,
+          matches: link.matches.map((match) => this.matchPayload(match)),
+        })),
+      };
+    }
+
+    const project = url.searchParams.get('project')
+      ? getProject(this.db, url.searchParams.get('project') as string)
+      : null;
+    if (!project) throw new Error('unknown project');
+    const limit = Number(url.searchParams.get('limit') ?? 6) || 6;
+    const includeSelf = url.searchParams.get('self') === '1';
+    const focus = projectFocus(this.db, project.id);
+    const result = findPriorArt(this.db, focus.text, {
+      excludeProjectIds: includeSelf ? [] : [project.id],
+      capabilities: focus.capabilities,
+      roles: focus.roles,
+      limit,
+      minScore: DEFAULT_MIN_SCORE,
+    });
+    // Document-level similarity still works when a project has no commits yet,
+    // which is the common case right after registering a folder.
+    const related = findRelatedProjects(this.db, project.id, { limit });
+    // `sharedConcepts` is what the UI prints as "similar logic, and here is the
+    // file it lives in over there".
+    return {
+      scope: project.name,
+      focus: { capabilities: focus.capabilities, roles: focus.roles.slice(0, 8) },
+      candidates: result.candidates,
+      commitsIndexed: countCommits(this.db, project.id),
+      projectsSearched: result.projectsSearched,
+      matches: result.matches.map((match) => this.matchPayload(match)),
+      projects: related.matches.map((match) => this.relatedProjectPayload(project, match)),
+    };
+  }
+
+  /** A project-to-project match, with the local timeline link to act on it. */
+  private relatedProjectPayload(
+    source: ProjectRow,
+    match: RelatedProject,
+  ): Record<string, unknown> {
+    return {
+      id: match.projectId,
+      project: match.projectName,
+      path: match.projectPath,
+      summary: match.summary,
+      stack: match.stack,
+      commits: match.commits,
+      lastActivity: match.lastActivity,
+      score: match.score,
+      why: explainProjectMatch(match),
+      sharedCapabilities: match.sharedCapabilities,
+      sharedWords: match.sharedWords.slice(0, 5),
+      relation: {
+        headline: match.relation.headline,
+        evidence: match.relation.evidence.map((item) => ({
+          idea: item.idea,
+          yours: item.yours,
+          source: item.source,
+          files: item.files.map((file) => ({ ...file, summary: explainFile(file) })),
+        })),
+      },
+      timeline: `brain timeline -p ${match.projectName}`,
+      relatedFrom: source.name,
+    };
+  }
+
+  /**
+   * Pre-flight: diff a plan against every decision and revert on record, so the
+   * UI can say "you rejected this before, because X".
+   */
+  private check(url: URL): Record<string, unknown> {
+    const proposal = (url.searchParams.get('q') ?? '').trim();
+    if (proposal.length === 0) throw new Error('type the plan you want checked');
+    const scope = url.searchParams.get('project');
+    const project = scope ? getProject(this.db, scope) : null;
+    if (scope && !project) throw new Error('unknown project');
+    const result = checkProposal(this.db, proposal, { projectId: project ? project.id : null });
+    return {
+      proposal: result.proposal,
+      verdict: result.verdict,
+      scope: project ? project.name : 'every project',
+      considered: result.considered,
+      findings: result.findings.map((finding) => ({
+        source: finding.source,
+        project: finding.projectName,
+        ts: finding.ts,
+        text: finding.text,
+        reason: finding.reason,
+        status: finding.status,
+        score: finding.score,
+        hash: finding.hash ? finding.hash.slice(0, 7) : null,
+        why: explainFinding(finding),
+      })),
+    };
+  }
+
+  private matchPayload(match: PriorArtMatch): Record<string, unknown> {
+    // (see relatedProjectPayload above for project-document matches)
+    const owner = getProject(this.db, match.projectName);
+    return {
+      project: match.projectName,
+      path: match.projectPath,
+      hash: match.hash.slice(0, 7),
+      subject: match.subject || '(no message)',
+      ts: match.ts,
+      files: match.files.slice(0, 3),
+      insertions: match.insertions,
+      deletions: match.deletions,
+      stack: match.stack,
+      score: match.score,
+      why: explainMatch(match),
+      url: commitUrl(owner?.git_remote ?? null, match.hash),
     };
   }
 
