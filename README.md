@@ -116,14 +116,19 @@ merge-sort into one honest timeline.
   *finished elsewhere*. Matching is structural, not textual: capability shapes (auth/session,
   realtime/streaming, data/ingestion…), the role a file plays in its repo (login, session, detector), and
   rare shared vocabulary — so `src/auth/login.ts` in one project matches `backend/api/auth/login.py` in
-  another. A project with no commits yet is still matched on its **overview document** (README + summary),
+  another. A single shared tag or filename is never enough: a match needs rare shared vocabulary, or two
+  specific problem shapes, or one specific shape and two files playing the same role — so an `alerts` file and
+  a `notifications` file are not treated as the same work. The stated reason leads with the sharpest evidence,
+  which is usually the shared vocabulary rather than the tag. A project with no commits yet is still matched on its **overview document** (README + summary),
   so a freshly registered folder that reads like an existing project shows up immediately. The match states
   the relation in prose — *"Test and Threvia are the same shape of system: both model relationships as a
-  graph…"* — then quotes your own README as evidence for each idea in common and **opens the file it already
-  lives in over there** to report the reusable pieces: *"bloom filter — you say: 'a Bloom Filter for instant
-  blacklist lookups' — backend/realtime/bloom_filter.py — Python, 238 lines · defines ThreatBloomFilter,
-  build_from_dataset, check, add · 'Phase 4A — Bloom Filter'"*. `--all` scans every registered project and
-  prints the links each one could borrow from the others, plus the pairs whose overviews read alike
+  graph…"* — then, for every idea the two documents share, states what your project does with it (*"Test uses a
+  Bloom Filter for instant blacklist lookups (stolen cards, flagged accounts, known mule accounts)."*) and
+  **opens each of the other project's files** to report what is reusable: *"backend/realtime/bloom_filter.py —
+  Python, 238 lines · does: Phase 4A — Bloom Filter · you can reuse: ThreatBloomFilter, build_from_dataset,
+  check, add"*. Files are read from disk, so a file deleted since that commit says so. `--all` scans every
+  registered project and prints the links each one could borrow from the others, plus the pairs whose
+  overviews read alike
 
 **Capture**
 - `brain daemon start|stop|restart|status` — the background capture daemon
@@ -190,10 +195,11 @@ opens it in your browser. It exists so you never have to remember the order of `
 - **Projects** — every project with its stored summary, stack, counts and watch state.
 - **Per project** — *Overview* (what is stored on the row), *Brief* (regenerate, optionally with the
   local LLM), *Related* (*Related projects* matched on the overview README even before any commit — a
-  headline saying how the two projects relate, then each shared idea with your own words quoted and, for the
-  files it lives in on the other side, what is actually inside them (language, line count, the definitions it
-  exports, its own docstring) — then the same work already finished in another project, each match linking to
-  its commit, plus **Before you build it** — type a plan and it diffs it against your logged decisions and
+  headline saying how the two projects relate, then each shared idea with a plain statement of what this
+  project does with it and, for every file it lives in on the other side, what the file contains (language,
+  line count, the definitions you could reuse, its own docstring) — then the same work already finished in
+  another project, each match linking to its commit, plus **Before you build it** — type a plan and it diffs it
+  against your logged decisions and
   every `Revert "..."` commit, repeating the reason you recorded), *Timeline* (1d/7d/30d/1y with the
   files each commit touched), *Ask* (hybrid recall with lexical/vector candidate counts and an honest
   warning when the results are semantic near-misses).

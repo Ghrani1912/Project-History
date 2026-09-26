@@ -7,7 +7,7 @@ import { ask } from '../dist/core/recall.js';
 import { getProject, registerProject, setProjectMeta } from '../dist/core/projects.js';
 import { createHashEmbedder } from '../dist/embeddings/embedder.js';
 import { aggregateChangedFiles } from '../dist/summarize/brief.js';
-import { buildProjectProfile, describeProject, renderProfileDoc } from '../dist/summarize/profile.js';
+import { buildProjectProfile, describeProject, excerpt, renderProfileDoc } from '../dist/summarize/profile.js';
 import { testDb, tmpDir } from './helpers.ts';
 
 const embedder = createHashEmbedder(256);
@@ -48,6 +48,23 @@ test('buildProjectProfile reads the README, stack, layout and entry points', asy
   assert.match(profile.doc, /project overview/);
   assert.match(profile.doc, /README/);
   db.close();
+});
+
+test('excerpt cuts prose on a word or sentence boundary, never mid-word', () => {
+  const text = `${'word '.repeat(30)}processing for transaction-scale data and more prose here.`;
+  const cut = excerpt(text, 140);
+  assert.ok(cut.length <= 140);
+  assert.ok(text.startsWith(cut));
+  // The next character in the source must be a boundary, so no half-word such
+  // as "tra" survives the cut.
+  const next = text[cut.length];
+  assert.ok(
+    next === undefined || /[\s.,;:)!?\-]/.test(next),
+    `cut mid-word before "${text.slice(cut.length, cut.length + 8)}"`,
+  );
+  assert.equal(excerpt('short text', 50), 'short text');
+  // A sentence end past the halfway mark is preferred over a ragged word cut.
+  assert.equal(excerpt('First sentence ends here. Second one runs on and on', 30), 'First sentence ends here.');
 });
 
 test('describeProject prefers README prose and falls back to structure', () => {

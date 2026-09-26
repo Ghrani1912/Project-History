@@ -10,6 +10,7 @@ import {
   explainFile,
   explainMatch,
   explainProjectMatch,
+  reuseList,
   findPriorArt,
   findRelatedProjects,
   projectFocus,
@@ -404,18 +405,21 @@ export function registerInsightCommands(program: Command): void {
                 out('');
                 out(`    ${related.relation.headline}`);
                 if (related.relation.evidence.length > 0) {
-                  out(`    ${c.grey(`already there in ${related.projectName} — these are the pieces to reuse:`)}`);
+                  out(`    ${c.grey(`what is already built in ${related.projectName}:`)}`);
                   for (const item of related.relation.evidence) {
                     out('');
                     out(`      ${c.bold(item.idea)}`);
-                    if (item.yours) out(`        ${c.grey(`you say: "${item.yours}"`)}`);
+                    if (item.uses) out(`        ${project?.name ?? 'this project'} uses ${item.uses}.`);
                     if (item.files.length === 0) {
                       out(`        ${c.grey('nothing found over there yet')}`);
                     }
                     for (const file of item.files) {
+                      const reuse = reuseList(file);
                       out(
                         `        ${explainFile(file)}${item.source === 'doc' ? c.grey(' (their README)') : ''}`,
                       );
+                      if (file.doc) out(`          ${c.grey(`does: ${file.doc}`)}`);
+                      if (reuse) out(`          ${c.grey(`you can reuse: ${reuse}`)}`);
                     }
                   }
                 }

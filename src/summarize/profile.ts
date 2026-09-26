@@ -253,10 +253,25 @@ export function readReadmeExcerpt(projectPath: string, maxChars = 1200): { file:
       .replace(/\n{3,}/g, '\n\n')
       .trim();
     if (cleaned.length === 0) return null;
-    return { file: path.basename(file), text: cleaned.slice(0, maxChars) };
+    return { file: path.basename(file), text: excerpt(cleaned, maxChars) };
   } catch {
     return null;
   }
+}
+
+/**
+ * Cut prose down to `maxChars` without chopping a word in half — a truncated
+ * "processing for tra" reads as gibberish, and worse, it becomes a junk token
+ * for cross-project matching. Prefers the last sentence that fits, then the
+ * last whole word, and only then hard-cuts.
+ */
+export function excerpt(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const head = text.slice(0, maxChars);
+  const sentenceEnd = Math.max(head.lastIndexOf('. '), head.lastIndexOf('\n'));
+  if (sentenceEnd >= maxChars * 0.5) return head.slice(0, sentenceEnd + 1).trimEnd();
+  const wordEnd = head.lastIndexOf(' ');
+  return wordEnd > 0 ? head.slice(0, wordEnd).trimEnd() : head;
 }
 
 export function detectEntryPoints(projectPath: string, limit = 6): string[] {
@@ -303,7 +318,7 @@ export function describeProject(input: {
         !/^[=*_-]{3,}$/.test(raw) &&
         /[a-zA-Z]/.test(clean),
     );
-  if (readmeLine) return readmeLine.clean.slice(0, 220);
+  if (readmeLine) return excerpt(readmeLine.clean, 220);
   const dirs = input.topLevel.filter((entry) => entry.kind === 'dir').map((entry) => entry.name.replace(/\/$/, ''));
   const stack = input.stack.length > 0 ? input.stack.join(', ') : input.languages[0]?.language ?? 'unknown stack';
   const shape = dirs.length > 0 ? ` with ${dirs.slice(0, 5).join(', ')}` : '';
@@ -432,7 +447,7 @@ export function renderProfileDoc(input: DocInput): string {
   if (input.recentCommits.length > 0) lines.push(`recent commits: ${input.recentCommits.join(' | ')}`);
   if (input.readme) {
     lines.push('README:');
-    lines.push(input.readme.slice(0, 1800));
+    lines.push(excerpt(input.readme, 1800));
   }
   return lines.join('\n');
 }

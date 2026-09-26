@@ -490,20 +490,27 @@ function relatedProjectEntry(match) {
   }
   var evidence = (relation && relation.evidence) || [];
   if (evidence.length) {
-    bits.push('<div class="muted" style="font-size:12px;margin-top:2px">Already there in <b>' + esc(match.project) + '</b> — these are the pieces to reuse:</div>');
+    var source = (relation && relation.sourceProject) || 'This project';
+    bits.push('<div class="muted" style="font-size:12px;margin-top:2px">What is already built in <b>' + esc(match.project) + '</b>:</div>');
     evidence.forEach(function (concept) {
       var files = concept.files || [];
       bits.push('<div style="font-size:12px;margin:6px 0 0 8px">' +
         '<b>' + esc(concept.idea || concept.term) + '</b>');
-      if (concept.yours) {
-        bits.push('<div class="muted" style="font-size:12px">you say: “' + esc(concept.yours) + '”</div>');
+      if (concept.uses) {
+        bits.push('<div style="font-size:12px">' + esc(source) + ' uses ' + esc(concept.uses) + '.</div>');
       }
       if (files.length === 0) {
         bits.push('<div class="muted" style="font-size:12px">nothing found over there yet</div>');
       }
       files.forEach(function (file) {
-        bits.push('<div class="mono" style="font-size:12px">' + esc(file.summary || file.path) +
+        bits.push('<div class="mono" style="font-size:12px;margin-top:2px">' + esc(file.summary || file.path) +
           (concept.source === 'doc' ? ' <span class="muted">(their README)</span>' : '') + '</div>');
+        if (file.doc) {
+          bits.push('<div class="muted" style="font-size:12px">does: ' + esc(file.doc) + '</div>');
+        }
+        if (file.reuse) {
+          bits.push('<div class="muted" style="font-size:12px">you can reuse: ' + esc(file.reuse) + '</div>');
+        }
       });
       bits.push('</div>');
     });

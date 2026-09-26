@@ -23,6 +23,7 @@ import {
   explainProjectMatch,
   findPriorArt,
   findRelatedProjects,
+  reuseList,
   projectFocus,
   type PriorArtMatch,
   type RelatedProject,
@@ -611,11 +612,16 @@ export class BrainUiServer {
       sharedWords: match.sharedWords.slice(0, 5),
       relation: {
         headline: match.relation.headline,
+        sourceProject: source.name,
         evidence: match.relation.evidence.map((item) => ({
           idea: item.idea,
-          yours: item.yours,
+          uses: item.uses,
           source: item.source,
-          files: item.files.map((file) => ({ ...file, summary: explainFile(file) })),
+          files: item.files.map((file) => ({
+            ...file,
+            summary: explainFile(file),
+            reuse: reuseList(file),
+          })),
         })),
       },
       timeline: `brain timeline -p ${match.projectName}`,

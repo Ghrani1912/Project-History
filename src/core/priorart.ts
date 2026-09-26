@@ -491,12 +491,19 @@ export function findPriorArt(db: Db, query: string, options: PriorArtOptions = {
     const sameStack = unit.languages.some((language) => query.toLowerCase().includes(language.toLowerCase()));
     if (sameStack) score += 0.3;
     if (score > bestCandidateWeight) bestCandidateWeight = score;
-    // Roles and words can only rank a candidate; they cannot make one, and a
-    // capability only counts when it is both specific and rare. Two files
-    // called api.py are a coincidence, not shared knowledge.
-    const informative = signals.some(
-      (signal) => signal.kind === 'capability' && signal.weight >= 0.5,
+    // Evidence has to survive the "is this just a coincidence?" test. One tag or
+    // one shared file word is not knowledge: a project with an `alerts` file and
+    // a project with a `notifications` file are not doing the same work. A match
+    // needs a rare shared word, or two specific problem shapes, or one specific
+    // shape *and* two files playing the same role.
+    const specificCapabilities = sharedCapabilities.filter(
+      (tag) => (CAPABILITY_WEIGHT[tag] ?? 0.5) >= 0.5,
     );
+    const rareTokens = sharedTokens.filter((token) => (tokenIdf.get(token) ?? 0) >= 1.2);
+    const informative =
+      rareTokens.length > 0 ||
+      specificCapabilities.length >= 2 ||
+      (specificCapabilities.length >= 1 && sharedRoles.length >= 2);
     if (score < minScore || !informative) continue;
     matches.push({
       projectId: unit.projectId,
@@ -579,8 +586,8 @@ export interface SharedConcept {
   file: string | null;
   /** Every file over there that carries the idea, best first, with contents. */
   files: ConceptFile[];
-  /** How *your* document phrased this idea, quoted from the README. */
-  yours: string | null;
+  /** What *this* project does with the idea, read from its own README. */
+  uses: string | null;
   /** `code` when found in that project's commits, `doc` when only in its README. */
   source: 'code' | 'doc';
 }
@@ -588,8 +595,8 @@ export interface SharedConcept {
 /** One line of proof for the relation headline. */
 export interface RelationEvidence {
   idea: string;
-  /** The sentence your own document used for this idea. */
-  yours: string | null;
+  /** The full clause this project's document uses for the idea. */
+  uses: string | null;
   /** Where it already exists over there, and what is inside each file. */
   files: ConceptFile[];
   source: 'code' | 'doc';
@@ -624,21 +631,36 @@ export interface RelatedProjectsResult {
  * the README body. The stored document also carries a generated header (path,
  * layout, languages, recent commits) that is near-identical for every project,
  * so keeping it would make any two projects look alike.
+ *
+ * The two halves are kept apart because the summary is a cut-short one-liner:
+ * matching may use both, but anything quoted back to the user must come from the
+ * README prose, where the complete clause still exists.
  */
-function overviewBody(text: string): string {
+function overviewParts(text: string): { summary: string; body: string } {
   const summary = /\nsummary:\s*([^\n]+)/.exec(text)?.[1] ?? '';
   const readme = /\nREADME:\s*\n?([\s\S]*)$/.exec(text);
   const body = readme ? (readme[1] ?? '') : text;
-  return `${summary}\n${body}`.trim();
+  return { summary, body };
 }
 
-/** The project overview document (README, stack, layout) as indexed at register time. */
-function projectOverviewText(db: Db, project: ProjectRow): string {
+
+/**
+ * A project's indexed overview document, split into the text to match on and
+ * the prose to quote from. One read of the stored document, parsed once.
+ */
+function projectOverview(db: Db, project: ProjectRow): { text: string; prose: string } {
   const row = db
     .prepare("SELECT text FROM search_docs WHERE owner_type = 'project' AND owner_id = ?")
     .get(project.id) as { text: string } | undefined;
-  if (row && row.text.trim().length > 0) return overviewBody(row.text);
-  return `${project.summary ?? ''} ${project.stack ?? ''} ${project.name}`.trim();
+  if (!row || row.text.trim().length === 0) {
+    const fallback = `${project.summary ?? ''} ${project.stack ?? ''} ${project.name}`.trim();
+    return { text: fallback, prose: fallback };
+  }
+  const { summary, body } = overviewParts(row.text);
+  return {
+    text: `${summary}\n${body}`.trim(),
+    prose: body.trim().length > 0 ? body : `${summary}\n${body}`.trim(),
+  };
 }
 
 /**
@@ -847,39 +869,52 @@ function escapeRegExp(text: string): string {
 }
 
 /**
- * The sentence the document itself used around an idea — quoted back so the
- * user sees *their* words as the thing that matched, not our keyword. The quote
- * is trimmed to one sentence so it never runs into a heading or a table.
+ * The complete clause a document uses for an idea — "a Bloom Filter for instant
+ * blacklist lookups (stolen cards, flagged accounts, known mule accounts)" —
+ * never a truncated fragment, so the statement stands on its own. Commas inside
+ * brackets are part of the clause, not boundaries of it.
  */
-function quoteFor(text: string, term: string, maxLength = 190): string | null {
+function clauseFor(text: string, term: string, maxLength = 240): string | null {
+  const normalized = text.replace(/\r\n?/g, '\n');
   const words = term.split(' ').filter((word) => word.length > 0).map(escapeRegExp);
   if (words.length === 0) return null;
-  const match = new RegExp(words.join('[^a-z0-9]+'), 'i').exec(text);
+  const match = new RegExp(words.join('[^a-z0-9]+'), 'i').exec(normalized);
   if (!match) return null;
-  const boundaries = ['\n', '. ', '! ', '? ', '; '];
+  const boundaries = [', ', '; ', '. ', ' — ', ' – ', ' | ', '\n'];
   const from = match.index;
   const to = from + match[0].length;
-  let start = 0;
-  let end = text.length;
-  for (const boundary of boundaries) {
-    const before = text.lastIndexOf(boundary, from);
-    if (before >= 0) start = Math.max(start, before + boundary.length);
-    const after = text.indexOf(boundary, to);
-    if (after >= 0) end = Math.min(end, after + (boundary === '\n' ? 0 : 1));
-  }
-  const sentence = text.slice(start, end).replace(/\s+/g, ' ').trim();
-  if (sentence.length === 0) return null;
-  if (sentence.length <= maxLength) return sentence;
-  // Some READMEs are one wall of text with no sentence breaks. Rather than
-  // repeat the whole paragraph for every idea, quote the neighbourhood of the
-  // match, snapped to whole words on both sides.
-  const windowStart = Math.max(start, from - 55);
-  const windowEnd = Math.min(end, to + 85);
-  let window = text.slice(windowStart, windowEnd).replace(/\s+/g, ' ').trim();
-  if (windowStart > start) window = window.replace(/^\S+\s+/, '');
-  if (windowEnd < end) window = window.replace(/\s+\S+$/, '');
-  if (window.length > maxLength) window = `${window.slice(0, maxLength).trim()}…`;
-  return `${windowStart > start ? '…' : ''}${window}${windowEnd < end ? '…' : ''}`;
+  const pick = (respectBrackets: boolean): string | null => {
+    let start = 0;
+    let end = normalized.length;
+    let depth = 0;
+    let closed = false;
+    for (let i = 0; i < normalized.length; i++) {
+      const char = normalized[i];
+      if (respectBrackets) {
+        if (char === '(') depth++;
+        else if (char === ')') depth = Math.max(0, depth - 1);
+      }
+      if (respectBrackets && depth > 0) continue;
+      const boundary = boundaries.find((candidate) => normalized.startsWith(candidate, i));
+      if (!boundary) continue;
+      if (i < from) start = i + boundary.length;
+      else if (i >= to) {
+        end = i;
+        closed = true;
+        break;
+      }
+    }
+    const clause = normalized
+      .slice(start, end)
+      .replace(/\s+/g, ' ')
+      .replace(/^(?:and|but|or|plus|also)\s+/i, '')
+      .trim();
+    if (clause.length === 0) return null;
+    return closed || clause.length <= maxLength ? clause : `${clause.slice(0, maxLength)}`;
+  };
+  const bracketed = pick(true);
+  if (bracketed && bracketed.length <= maxLength) return bracketed;
+  return pick(false) ?? bracketed;
 }
 
 /** Human phrasing for a shared capability, so the headline reads like a claim. */
@@ -932,7 +967,7 @@ export function relationNarrative(
     headline,
     evidence: concepts.map((concept) => ({
       idea: concept.term,
-      yours: concept.yours,
+      uses: concept.uses,
       files: concept.files,
       source: concept.source,
     })),
@@ -974,17 +1009,17 @@ function conceptsBetween(
   const out: Array<{ concept: SharedConcept; weight: number }> = [];
   for (const term of sourceTerms) {
     const located = otherEvidence.length > 0 ? locateConceptFiles(term, otherEvidence) : [];
-    const yours = quoteFor(sourceDoc, term);
+    const uses = clauseFor(sourceDoc, term);
     let concept: SharedConcept | null = null;
     if (located.length > 0) {
       const files = located.map((file) => inspectFile(otherPath, file));
-      concept = { term, file: located[0] ?? null, files, yours, source: 'code' };
+      concept = { term, file: located[0] ?? null, files, uses, source: 'code' };
     } else if (otherEvidence.length === 0 && otherTerms.has(term)) {
       concept = {
         term,
         file: otherDocFile,
         files: [inspectFile(otherPath, otherDocFile)],
-        yours,
+        uses,
         source: 'doc',
       };
     }
@@ -1026,7 +1061,7 @@ function conceptsBetween(
             [...a.concept.files, ...b.concept.files].map((file) => [file.path, file]),
           ).values(),
         ],
-        yours: quoteFor(sourceDoc, `${left} ${right}`) ?? a.concept.yours,
+        uses: clauseFor(sourceDoc, `${left} ${right}`) ?? a.concept.uses,
         source: a.concept.source,
       },
       weight: Math.max(a.weight, b.weight) + 0.4,
@@ -1081,8 +1116,10 @@ export function findRelatedProjects(
 
   const excluded = new Set([projectId, ...(options.excludeProjectIds ?? [])]);
   const docs = projects.map((project) => {
-    const text = projectOverviewText(db, project);
-    return { project, text, capabilities: capabilitiesOf(text), tokens: meaningfulTokens(text) };
+    // `text` is matched on (summary + README); `prose` is what gets quoted, so
+    // the evidence is a complete sentence rather than a cut-short summary.
+    const { text, prose } = projectOverview(db, project);
+    return { project, text, prose, capabilities: capabilitiesOf(text), tokens: meaningfulTokens(text) };
   });
   const targetDoc = docs.find((doc) => doc.project.id === projectId) ?? null;
   if (!targetDoc) return { matches: [], considered: 0, bestCandidateScore: 0 };
@@ -1133,7 +1170,7 @@ export function findRelatedProjects(
       capabilitySignals.some((weight) => weight >= 0.5) || rareWords.length >= 2;
     if (score < minScore || !informative) continue;
     const sharedConcepts = conceptsBetween(
-      targetDoc.text,
+      targetDoc.prose,
       doc.text,
       doc.project.path,
       footprintOf(doc.project.id),
@@ -1188,14 +1225,17 @@ export function explainConcept(concept: SharedConcept): string {
   return concept.source === 'code' ? `${concept.term} — ${where}` : `${concept.term} — ${where} (README)`;
 }
 
-/** "backend/realtime/bloom_filter.py — Python, 96 lines · defines BloomFilter" */
+/** "backend/realtime/bloom_filter.py — Python, 238 lines" */
 export function explainFile(file: ConceptFile): string {
-  if (!file.exists) return `${file.path} — not on disk any more (moved or deleted since that commit)`;
-  if (file.language === null) return `${file.path} — ${file.lines} lines`;
-  const bits: string[] = [`${file.language}, ${file.lines} lines`];
-  if (file.symbols.length > 0) bits.push(`defines ${file.symbols.join(', ')}`);
-  if (file.doc) bits.push(`"${file.doc}"`);
-  return `${file.path} — ${bits.join(' · ')}`;
+  if (!file.exists) return `${file.path} — no longer on disk (moved or deleted since that commit)`;
+  return file.language === null
+    ? `${file.path} — ${file.lines} lines`
+    : `${file.path} — ${file.language}, ${file.lines} lines`;
+}
+
+/** The callable surface you would actually lift out of the file, if any. */
+export function reuseList(file: ConceptFile): string | null {
+  return file.symbols.length > 0 ? file.symbols.join(', ') : null;
 }
 
 export interface CrossProjectLink {
@@ -1261,20 +1301,24 @@ export function crossProjectLinks(
  * shared problem shape is the claim being made; shared words only ever rank.
  */
 export function explainMatch(match: PriorArtMatch): string {
-  const order: Array<PriorArtSignal['kind']> = ['capability', 'role', 'word'];
   const reasons: string[] = [];
-  for (const kind of order) {
-    for (const signal of match.signals) {
-      if (signal.kind !== kind) continue;
-      if (signal.weight < 0.5) continue; // filler evidence, not a reason
-      if (kind === 'word' && match.sharedCapabilities.length > 0) continue;
-      if (kind === 'capability') reasons.push(`same kind of problem: ${signal.value}`);
-      else if (kind === 'role') reasons.push(`same role in the code: ${signal.value}`);
-      else reasons.push(`shared word: ${signal.value}`);
-      if (reasons.length >= 3) break;
-    }
-    if (reasons.length >= 3) break;
-  }
+  // Lead with the sharpest evidence. A rare shared word (metrics, corpus, eval)
+  // says more about the work than a tag that is true of half your repositories,
+  // so vocabulary must not be hidden just because a tag also matched.
+  const words = match.signals
+    .filter((signal) => signal.kind === 'word' && signal.weight >= 0.8)
+    .map((signal) => signal.value)
+    .slice(0, 3);
+  if (words.length > 0) reasons.push(`shared vocabulary: ${words.join(', ')}`);
+  const capabilities = match.sharedCapabilities
+    .filter((tag) => (CAPABILITY_WEIGHT[tag] ?? 0.5) >= 0.5)
+    .slice(0, 2);
+  if (capabilities.length > 0) reasons.push(`same kind of problem: ${capabilities.join(', ')}`);
+  const roles = match.signals
+    .filter((signal) => signal.kind === 'role' && signal.weight >= 0.5)
+    .map((signal) => signal.value)
+    .slice(0, 2);
+  if (roles.length > 0 && reasons.length < 3) reasons.push(`same role in the code: ${roles.join(', ')}`);
   if (match.sameStack && reasons.length < 3) reasons.push('same language');
   return reasons.join(' · ');
 }

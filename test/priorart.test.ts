@@ -15,6 +15,7 @@ import {
   findRelatedProjects,
   pathRoles,
   projectFocus,
+  reuseList,
 } from '../dist/core/priorart.js';
 import { upsertSearchDoc } from '../dist/core/indexing.js';
 import { registerProject } from '../dist/core/projects.js';
@@ -181,6 +182,47 @@ test('findPriorArt ranks the closest of several candidates first', () => {
   assert.ok(result.matches.length > 0);
   assert.equal(result.matches[0]?.projectName, 'threvia');
   assert.equal(result.matches[0]?.hash, 'c'.repeat(40));
+  // The reason has to lead with the sharp evidence — the rare shared words —
+  // not with a tag that is true of half the repositories.
+  assert.match(explainMatch(result.matches[0] as never), /^shared vocabulary: .*ingestion/);
+  db.close();
+});
+
+test('one generic tag plus one shared file word is a coincidence, not a match', () => {
+  const dir = tmpDir('secondbrain-priorart-coincidence-');
+  fs.mkdirSync(path.join(dir, 'alerts'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'detector'), { recursive: true });
+  const db = testDb(tmpDir('secondbrain-priorart-coincidence-db-'));
+  const alerts = registerProject(db, path.join(dir, 'alerts')).project;
+  const detector = registerProject(db, path.join(dir, 'detector')).project;
+  // One project has an alerting file, the other a detection file. Two different
+  // codebases that happen to use two of the same words.
+  upsertCommit(db, {
+    projectId: alerts.id,
+    hash: '1'.repeat(40),
+    message: 'write the alert path',
+    filesChanged: 1,
+    insertions: 30,
+    deletions: 1,
+    files: [{ path: 'backend/realtime/alert_writer.py', add: 30, del: 1 }],
+    ts: 1_700_000_000_000,
+  });
+  upsertCommit(db, {
+    projectId: detector.id,
+    hash: '2'.repeat(40),
+    message: 'write the detector policy',
+    filesChanged: 1,
+    insertions: 40,
+    deletions: 2,
+    files: [{ path: 'backend/realtime/detection_policy.py', add: 40, del: 2 }],
+    ts: 1_700_100_000_000,
+  });
+  const result = findPriorArt(db, 'ship alerts for what the detector flags', {
+    capabilities: ['notifications'],
+    roles: ['detection'],
+  });
+  assert.deepEqual(result.matches, []);
+  assert.ok(result.bestCandidateWeight > 0, 'the candidate was scored, just not shown');
   db.close();
 });
 
@@ -381,7 +423,7 @@ test('findRelatedProjects states the relation in prose and quotes your own words
   // …and each piece of evidence quotes the user's own README and names the file.
   const bloom = (best?.relation.evidence ?? []).find((item) => /bloom/i.test(item.idea));
   assert.ok(bloom, `expected bloom-filter evidence: ${JSON.stringify(best?.relation.evidence)}`);
-  assert.match(bloom?.yours ?? '', /Bloom Filter for instant blacklist lookups/);
+  assert.match(bloom?.uses ?? '', /Bloom Filter for instant blacklist lookups/);
   assert.ok(bloom?.files.some((file) => file.path === 'backend/realtime/bloom_filter.py'));
   db.close();
 });
@@ -453,7 +495,8 @@ test('findRelatedProjects reports what is inside the other project\'s files', ()
   assert.ok(file?.symbols.includes('check'));
   assert.ok(!file?.symbols.includes('__init__'));
   assert.equal(file?.doc, 'Phase 4A — fast blacklist membership checks.');
-  assert.match(explainFile(file as never), /Python, 12 lines · defines ThreatBloomFilter/);
+  assert.equal(explainFile(file as never), 'backend/realtime/bloom_filter.py — Python, 12 lines');
+  assert.match(reuseList(file as never) ?? '', /^ThreatBloomFilter, build_from_dataset, check$/);
   db.close();
 });
 
