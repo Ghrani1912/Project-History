@@ -160,6 +160,23 @@ export function hasOllamaModel(models: string[], model: string): boolean {
   return models.some((name) => name === wanted || name === base || name.startsWith(`${base}:`));
 }
 
+/**
+ * The installed name that satisfies `model`, or null when none does.
+ * Ollama matches the exact tag, so a config of "llama3.2" has to be sent as
+ * whatever is actually pulled ("llama3.2:1b"); the bare name would resolve to
+ * ":latest" and 404 even though hasOllamaModel() says the model is available.
+ */
+export function resolveOllamaModel(models: string[], model: string): string | null {
+  const wanted = model.trim();
+  const base = wanted.split(':')[0] ?? wanted;
+  return (
+    models.find((name) => name === wanted) ??
+    models.find((name) => name === base) ??
+    models.find((name) => name.startsWith(`${base}:`)) ??
+    null
+  );
+}
+
 export async function probeOllama(url: string, model?: string, timeoutMs = 1500): Promise<boolean> {
   const models = await listOllamaModels(url, timeoutMs);
   if (!models) return false;

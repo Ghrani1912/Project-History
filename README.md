@@ -228,7 +228,21 @@ Embeddings come from **Ollama** (`nomic-embed-text` by default) when it is reach
 is installed**. Otherwise `brain` falls back to a deterministic hashed bag-of-words embedder, so
 recall works with zero setup and no network. Summaries use the same logic: Ollama when available,
 otherwise a high-quality deterministic brief — and when the LLM is skipped, `brain brief` prints
-*why* and the exact command that fixes it (`ollama pull llama3.2`).
+*why* and the exact command that fixes it (`ollama pull llama3.2`). The default local model is
+`llama3.2` — the 3B tag, which follows a question's premise and resists inventing details noticeably
+better than the 1B one. Whatever tag is actually pulled is resolved against the installed list, so a
+config of `llama3.2` runs `llama3.2:latest` (or `:1b`) with no config change.
+
+**The evidence guard.** `brain ask` refuses to answer two shapes of question it cannot ground, and
+says so rather than letting a model improvise:
+
+- **Negative premises.** A question that presumes a failure (*"why is this failing?"*, *"what's
+  wrong with the build?"*) is only answered when the record actually contains a failed command
+  (`exit_code != 0`) or a revert. With no failure captured, it states that plainly and consults no
+  model — the alternative is a fabricated cause.
+- **Architecture questions.** A question about how the thing is built needs a retrieval match above a
+  confidence floor; a distant nearest passage is not enough to ground an answer, so the question is
+  refused instead of letting the model design a system that is not there.
 
 ## Configuration
 

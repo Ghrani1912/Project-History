@@ -9,7 +9,7 @@ import { dotfileAdapter, parseTimestampedText } from '../dist/adapters/dotfile.j
 import { walkForMessages, vscodeChatAdapter } from '../dist/adapters/vscodeChat.js';
 import { runAdapters } from '../dist/adapters/index.js';
 import { makeIndexer } from '../dist/capture/ingest.js';
-import { createHashEmbedder } from '../dist/embeddings/embedder.js';
+import { createHashEmbedder, resolveOllamaModel } from '../dist/embeddings/embedder.js';
 import { testDb, tmpDir, writeJsonl } from './helpers.ts';
 
 function configWith(overrides: Partial<(typeof DEFAULT_CONFIG)['adapters']>): typeof DEFAULT_CONFIG {
@@ -170,4 +170,14 @@ test('vscodeChatAdapter reports nothing when no editor state exists', async () =
   // On a machine with editors installed this still must not throw.
   const events = await vscodeChatAdapter.collect(DEFAULT_CONFIG, { limit: 5 });
   assert.ok(Array.isArray(events));
+});
+
+test('resolveOllamaModel names the tag that is actually installed', () => {
+  const models = ['llama3.2:1b', 'nomic-embed-text:latest'];
+  // The config says "llama3.2" but only the :1b tag is pulled. Sending the bare
+  // name would make Ollama look for ":latest" and fail, so it must resolve.
+  assert.equal(resolveOllamaModel(models, 'llama3.2'), 'llama3.2:1b');
+  assert.equal(resolveOllamaModel(models, 'llama3.2:1b'), 'llama3.2:1b');
+  assert.equal(resolveOllamaModel(['llama3.2'], 'llama3.2'), 'llama3.2');
+  assert.equal(resolveOllamaModel(['nomic-embed-text:latest'], 'llama3.2'), null);
 });

@@ -29,6 +29,7 @@ import {
   type RelatedProject,
 } from '../core/priorart.js';
 import { checkProposal, explainFinding } from '../core/preflight.js';
+import { answerQuestion } from '../core/answer.js';
 
 /** Deep link to a commit when the project has a hosting remote we understand. */
 export function commitUrl(remote: string | null, hash: string): string | null {
@@ -688,6 +689,15 @@ export class BrainUiServer {
       projectId: project?.id ?? null,
       limit: Number(url.searchParams.get('limit') ?? 8) || 8,
     });
+    // The caller asked a question; hand back a written answer plus the passages
+    // it was built from, rather than only a ranked list.
+    const answer = await answerQuestion(this.db, this.options.config, {
+      query,
+      project,
+      hits: result.hits,
+      weak: result.weak,
+      useLlm: url.searchParams.get('ai') !== '0',
+    });
     return {
       query,
       project: project?.name ?? null,
@@ -696,6 +706,13 @@ export class BrainUiServer {
       vectorCount: result.vectorCount,
       bestVectorScore: result.bestVectorScore,
       weak: result.weak,
+      answer: {
+        text: answer.text,
+        generator: answer.generator,
+        partial: answer.partial,
+        sources: answer.sources,
+        llm: answer.llm,
+      },
       hits: result.hits.map((hit) => ({
         ownerType: hit.ownerType,
         projectName: hit.projectName,

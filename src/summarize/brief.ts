@@ -8,7 +8,7 @@ import { buildTimeline } from '../core/timeline.js';
 import { lastEventId, recentEvents } from '../core/events.js';
 import type { ChatTurnRow, CommitRow, DecisionRow, EventRow, ProjectRow, TimelineEntry } from '../core/types.js';
 import { gitStatusShort } from '../git/git.js';
-import { hasOllamaModel, listOllamaModels } from '../embeddings/embedder.js';
+import { hasOllamaModel, listOllamaModels, resolveOllamaModel } from '../embeddings/embedder.js';
 import { createOllamaLlm } from '../llm/ollama.js';
 import { log } from '../util/logger.js';
 import { formatDay, plural, relativeTime, truncate } from '../util/format.js';
@@ -778,9 +778,13 @@ export async function generateBrief(
     } else if (!hasOllamaModel(models, config.llm.model)) {
       llm.reason = `model "${config.llm.model}" is not installed — run: ollama pull ${config.llm.model}`;
     } else {
+      // Send the tag that is actually installed ("llama3.2:1b"), not the bare
+      // config name, which Ollama would resolve to a missing ":latest".
+      const installed = resolveOllamaModel(models, config.llm.model) ?? config.llm.model;
+      llm.model = installed;
       const client = createOllamaLlm({
         url: config.llm.ollamaUrl,
-        model: config.llm.model,
+        model: installed,
         timeoutMs: config.llm.timeoutMs,
       });
       const digest = renderDigest(data);

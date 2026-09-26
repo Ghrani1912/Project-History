@@ -1,4 +1,5 @@
 import type { Command } from 'commander';
+import { detectEvidenceGap } from '../core/answer.js';
 import { ask } from '../core/recall.js';
 import type { OwnerType, SearchHit } from '../core/types.js';
 import { relativeTime, truncate } from '../util/format.js';
@@ -66,6 +67,10 @@ export function registerRecallCommands(program: Command): void {
               since,
               ownerTypes,
             });
+            // Same evidence guard the UI answers use: a negative premise with no
+            // recorded failure, or an architecture question retrieval cannot
+            // ground, is refused here too rather than dressed up as results.
+            const gap = detectEvidenceGap(db, project?.id ?? null, query, result.hits[0]?.score ?? 0);
             if (options.json) {
               printJson({
                 query,
@@ -76,8 +81,13 @@ export function registerRecallCommands(program: Command): void {
                 bestVectorScore: result.bestVectorScore,
                 ownerTypes: result.ownerTypes,
                 weak: result.weak,
+                refusal: gap ? gap.reason : null,
                 hits: result.hits,
               });
+              return;
+            }
+            if (gap) {
+              warn(gap.reason);
               return;
             }
             heading(`“${query}”${project ? ` — ${project.name}` : ''}`);

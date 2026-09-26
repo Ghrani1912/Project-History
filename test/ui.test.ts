@@ -16,8 +16,17 @@ test('the UI page is one self-contained document with the run token', () => {
   assert.ok(!/<(link|script)[^>]+(src|href)=/i.test(html));
   assert.ok(html.includes('Track a folder'));
   assert.ok(html.includes('Register folder'));
-  // The cross-project prior-art panel is part of the project detail tabs.
+  // The workbench shell: sidebar of workspaces, the Auto-Brief / timeline split.
+  assert.ok(html.includes('Connected Workspaces'));
+  assert.ok(html.includes('Auto-Brief'));
+  assert.ok(html.includes('Ask Second Brain'));
+  assert.ok(html.includes('Unified') || html.includes('Live Feed'));
+  // The project sections stay the ones the CLI and the earlier UI exposed.
   assert.ok(html.includes("var tabs = ['overview', 'brief', 'related', 'timeline', 'ask']"));
+  // Recall is back on its own project tab, not only in the ⌘K palette.
+  assert.ok(html.includes('/api/ask?project='));
+  assert.ok(html.includes('Ask this workspace'));
+  // The cross-project prior-art panel lives in the left column of the detail split.
   assert.ok(html.includes('/api/related?project='));
   assert.ok(html.includes('Find similar work'));
   // Pre-flight: the same tab diffs a plan against past decisions and reverts.
