@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Db } from '../db/index.js';
+import type { BrainConfig } from '../config.js';
+import { createOllamaLlm } from '../llm/ollama.js';
+import { hasOllamaModel, listOllamaModels, resolveOllamaModel } from '../embeddings/embedder.js';
 import { countCommits, listCommits } from '../core/commits.js';
 import type { ProjectRow } from '../core/types.js';
 import { git } from '../git/git.js';
@@ -33,6 +36,15 @@ export interface ProjectProfile {
   lastCommit: { hash: string; message: string; ts: number } | null;
   /** Indexable text handed to the lexical + vector index. */
   doc: string;
+  /**
+   * Purpose written by the local model from source evidence, when the heuristics
+   * could only produce a generic summary. Null when never attempted or refused.
+   */
+  purposeSummary: string | null;
+  /** Files the derived purpose was grounded in, for display and provenance. */
+  purposeBasis: string[];
+  /** Why no purpose could be derived, when one was attempted. */
+  purposeReason: string | null;
 }
 
 const EXTENSION_LANGUAGES: Record<string, string> = {
@@ -148,6 +160,236 @@ const ENTRY_POINT_CANDIDATES = [
 ];
 
 const README_CANDIDATES = ['README.md', 'readme.md', 'Readme.md', 'README.rst', 'README.txt', 'README'];
+
+/**
+ * How much source the purpose-writer is allowed to read, and how much of what
+ * it reads may reach the prompt. Bounded on purpose: the whole point is to let
+ * a small local model characterize a repo it could never ingest whole.
+ */
+const PURPOSE_SNIPPET_LIMIT = 26;
+const PURPOSE_SNIPPET_CHARS = 240;
+const PURPOSE_PROMPT_CHARS = 3500;
+
+/**
+ * Purpose-bearing statements live at module scope: docstrings, header comments
+ * and the top of the file. Long or deep-nested code is noise for this reader.
+ */
+const PURPOSE_FILE_CANDIDATES = [
+  'app.py', 'main.py', 'manage.py', 'wsgi.py', 'index.js', 'index.ts', 'index.jsx', 'index.tsx',
+  'main.js', 'main.ts', 'server.js', 'server.ts', 'app.js', 'app.ts', 'app.tsx', 'App.tsx',
+  'cli.js', 'cli.ts', 'main.go', 'main.rs', 'lib.rs', 'Program.cs',
+];
+
+/** Extensions worth a header read. */
+const PURPOSE_SOURCE_EXTS = new Set([
+  '.py', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.go', '.rs', '.rb', '.php', '.java', '.kt', '.cs',
+]);
+
+/** Folders that never say what a project is for, plus generated outputs. */
+const PURPOSE_SKIP_DIRS = new Set([
+  ...NOISE_DIRS,
+  'tests', 'test', '__tests__', 'spec', 'docs', 'doc', 'examples', 'example',
+  'benchmarks', 'migrations', 'scripts', 'setup', 'assets', 'public', 'locales',
+]);
+
+/**
+ * Raw material for deriving what a repo is for when no README says it: the
+ * project manifest (name/description/scripts, the strongest signal there is)
+ * plus the heads of the most plausibly central source files.
+ */
+export interface PurposeEvidence {
+  manifest: string | null;
+  snippets: Array<{ file: string; head: string }>;
+  rendered: string | null;
+}
+
+/** package.json / pyproject.toml / Cargo.toml, compacted to the useful lines. */
+export function readManifestSignal(projectPath: string): string | null {
+  const tryJson = (): string | null => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(projectPath, 'package.json'), 'utf8')) as {
+        name?: string;
+        description?: string;
+        bin?: unknown;
+        scripts?: Record<string, string>;
+        dependencies?: Record<string, string>;
+      };
+      const bits: string[] = [];
+      if (parsed.name) bits.push(`name: ${parsed.name}`);
+      if (parsed.description) bits.push(`description: ${parsed.description}`);
+      if (parsed.bin) bits.push(`command-line entry: ${Object.keys(parsed.bin).join(', ')}`);
+      if (parsed.scripts?.start) bits.push(`start script: ${parsed.scripts.start}`);
+      if (parsed.scripts?.dev) bits.push(`dev script: ${parsed.scripts.dev}`);
+      if (parsed.dependencies) {
+        const deps = Object.keys(parsed.dependencies).filter((dep) => !dep.startsWith('@types/')).slice(0, 15);
+        if (deps.length > 0) bits.push(`key dependencies: ${deps.join(', ')}`);
+      }
+      return bits.length > 0 ? bits.join('\n') : null;
+    } catch {
+      return null;
+    }
+  };
+  const json = tryJson();
+  if (json) return json;
+  const pyproject = path.join(projectPath, 'pyproject.toml');
+  if (fs.existsSync(pyproject)) {
+    try {
+      const lines = fs
+        .readFileSync(pyproject, 'utf8')
+        .split('\n')
+        .filter((line) => /^(name|description|version)\s*=|^dependencies\s*=|^\s*"[a-z]/i.test(line))
+        .slice(0, 12);
+      if (lines.length > 0) return ['pyproject.toml:', ...lines].join('\n');
+    } catch {
+      /* fall through */
+    }
+  }
+  return null;
+}
+
+/**
+ * Signal inside a file that says what it does when the header does not:
+ * argparse descriptions, Flask/CLI route registrations, and stored procs.
+ * Matched against the first chunk of the file to keep the walk bounded.
+ */
+const FILE_SIGNAL_RE =
+  /(?:argparse\.ArgumentParser\(\s*description=["']([^"']{10,140})["'])|(?:@(?:app|bp)\.route\(["']([^"']{4,80})["'])|(?:CREATE TABLE (?:IF NOT EXISTS )?(\w+))/;
+
+/**
+ * The first meaningful prose of a source file — module docstring or header
+ * comment — which is where authors explain what the file does. Falls back to
+ * inline signals (argparse descriptions, route registrations, SQL schemas)
+ * because real code often opens straight into imports. Returns null when the
+ * file yields nothing purpose-bearing.
+ */
+export function sourceHeadProse(full: string): string | null {
+  let raw = '';
+  try {
+    raw = fs.readFileSync(full, 'utf8');
+  } catch {
+    return null;
+  }
+  const lines = raw.split('\n');
+  const prose: string[] = [];
+  for (const line of lines.slice(0, 60)) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) {
+      if (prose.length > 0) break;
+      continue;
+    }
+    // One-line comments and Python module docstrings.
+    const comment = /^(?:\/\/|#|\*)\s*(.+)$/.exec(trimmed);
+    if (comment && comment[1] && /[a-zA-Z]/.test(comment[1]) && comment[1].length > 12) {
+      prose.push(comment[1]);
+      continue;
+    }
+    const block = /^\/\*\*?\s*(.+?)\s*(?:\*\/)?$/.exec(trimmed);
+    if (block && block[1] && block[1].length > 12 && !/^[*@]/.test(block[1])) {
+      prose.push(block[1]);
+      continue;
+    }
+    const docstring = /^(?:\"\"\"|''')(.*?)(?:\"\"\"|''')?\s*$/.exec(trimmed);
+    if (docstring && docstring[1] && docstring[1].length > 12) {
+      prose.push(docstring[1]);
+      if (prose.length >= 3) break;
+      continue;
+    }
+    break; // real code reached; the header is over
+  }
+  if (prose.length === 0) {
+    // No header prose — try inline signals from the first part of the file.
+    const signal = FILE_SIGNAL_RE.exec(raw.slice(0, 20_000));
+    if (signal) {
+      const text = (signal[1] ?? signal[2] ?? signal[3] ?? '').trim();
+      if (text.length > 4) return excerpt(`defines ${text}`, PURPOSE_SNIPPET_CHARS);
+    }
+    return null;
+  }
+  return excerpt(prose.join(' '), PURPOSE_SNIPPET_CHARS);
+}
+
+/** Pick central source files, bounded, and keep the head prose of each. */
+export function collectPurposeEvidence(projectPath: string, maxSnippets = PURPOSE_SNIPPET_LIMIT): PurposeEvidence {
+  const manifest = readManifestSignal(projectPath);
+  // The README participates even when its first line did not qualify as a
+  // summary tagline: headings and bullet lists that describe the project are
+  // purpose evidence for the model, just not presentable as one prose line.
+  const readme = readReadmeExcerpt(projectPath, 1200);
+  const manifestWithReadme =
+    readme && manifest ? `${manifest}\nREADME excerpt:\n${readme.text}` : readme ? `README excerpt:\n${readme.text}` : manifest;
+  const snippets: Array<{ file: string; head: string }> = [];
+  const seen = new Set<string>();
+  const push = (full: string, rel: string): void => {
+    if (snippets.length >= maxSnippets || seen.has(rel)) return;
+    seen.add(rel);
+    const head = sourceHeadProse(full);
+    if (head) snippets.push({ file: rel, head });
+  };
+  // 1. Known entry points, wherever they sit.
+  for (const candidate of ENTRY_POINT_CANDIDATES) {
+    if (snippets.length >= maxSnippets) break;
+    const full = path.join(projectPath, candidate);
+    if (fs.existsSync(full) && fs.statSync(full).isFile()) push(full, candidate);
+  }
+  // 2. Bounded walk over source files. Exact-name candidates first (they are
+  // the conventional centers), then everything else by name — a repo like a
+  // research pipeline names its stages descriptively (data_collector.py), and
+  // those names never appear on a fixed list.
+  const allSource: Array<{ full: string; rel: string; priority: boolean }> = [];
+  const visit = (dir: string, level: number): void => {
+    if (level > 3 || allSource.length >= 200) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const names = entries
+      .filter((entry) => !NOISE_DIRS.has(entry.name) && !PURPOSE_SKIP_DIRS.has(entry.name))
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+    for (const name of names) {
+      if (allSource.length >= 200) return;
+      const full = path.join(dir, name);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        visit(full, level + 1);
+        continue;
+      }
+      if (!PURPOSE_SOURCE_EXTS.has(path.extname(name).toLowerCase())) continue;
+      allSource.push({
+        full,
+        rel: path.relative(projectPath, full).replace(/\\/g, '/'),
+        priority: PURPOSE_FILE_CANDIDATES.includes(name),
+      });
+    }
+  };
+  visit(projectPath, 1);
+  allSource
+    .sort((a, b) => Number(b.priority) - Number(a.priority) || a.rel.localeCompare(b.rel))
+    .slice(0, maxSnippets * 3)
+    .forEach((entry) => push(entry.full, entry.rel));
+  visit(projectPath, 1);
+  return { manifest: manifestWithReadme, snippets, rendered: renderPurposeEvidence({ manifest: manifestWithReadme, snippets }) };
+}
+
+/** The bounded text the purpose-writer is allowed to read. */
+export function renderPurposeEvidence(
+  evidence: Pick<PurposeEvidence, 'manifest' | 'snippets'>,
+): string | null {
+  const parts: string[] = [];
+  if (evidence.manifest) parts.push(evidence.manifest);
+  for (const snippet of evidence.snippets) {
+    parts.push(`${snippet.file}: ${snippet.head}`);
+  }
+  if (parts.length === 0) return null;
+  return excerpt(parts.join('\n'), PURPOSE_PROMPT_CHARS);
+}
 
 function languageFor(file: string): string | null {
   const ext = path.extname(file).replace(/^\./, '').toLowerCase();
@@ -327,9 +569,28 @@ export function describeProject(input: {
   return `${input.name} — ${stack === 'unknown stack' ? 'an' : 'a'} ${stack} project${shape}.`;
 }
 
+/**
+ * describeProject falls back to "Name — a Stack project with a, b, c." when no
+ * README line qualifies. That records the folder layout, not the project's
+ * purpose — so every surface that would otherwise read purpose into it can
+ * detect the case and treat it differently.
+ */
+export function isGenericOverview(summary: string | null): boolean {
+  if (!summary || summary.trim().length === 0) return true;
+  return / — (?:a|an) .+ (?:project|service|tool|app)\b/.test(summary.trim());
+}
+
 export interface BuildProfileOptions {
   /** Commit subjects to include in the recall document. */
   recentCommits?: number;
+  /**
+   * The local chat model may be asked to characterize a repo that no README
+   * describes. Off by default: it is an LLM call on the registration path.
+   */
+  useLlmPurpose?: boolean;
+  config?: BrainConfig;
+  /** Set when an earlier call already failed, so refreshes do not re-pay it. */
+  purposeAttempted?: boolean;
 }
 
 export async function buildProjectProfile(
@@ -363,7 +624,27 @@ export async function buildProjectProfile(
   const recent = listCommits(db, project.id, options.recentCommits ?? 10);
   const last = recent[0] ?? null;
 
-  const summary = describeProject({ name: project.name, stack, languages, topLevel, readme: readme?.text ?? null });
+  let summary = describeProject({ name: project.name, stack, languages, topLevel, readme: readme?.text ?? null });
+  // A generic fallback summary means nothing on disk or in the record says what
+  // this project is for. When a chat model is available, derive a purpose from
+  // the source itself — manifest, entry-point and file-header prose — rather
+  // than leaving the answer layer to guess. Once tried and failed it is not
+  // retried until something asks for it explicitly.
+  let purposeSummary: string | null = null;
+  let purposeBasis: string[] = [];
+  let purposeReason: string | null = null;
+  if (!options.purposeAttempted && options.useLlmPurpose && options.config && isGenericOverview(summary)) {
+    const evidence = collectPurposeEvidence(projectPath);
+    if (evidence.rendered) {
+      const derived = await deriveProjectPurpose(options.config, evidence, project.name);
+      purposeSummary = derived.summary;
+      purposeBasis = derived.basis;
+      purposeReason = derived.reason;
+      if (purposeSummary) summary = purposeSummary;
+    } else {
+      purposeReason = 'no readable source or manifest to derive a purpose from';
+    }
+  }
 
   const doc = renderProfileDoc({
     project,
@@ -401,6 +682,9 @@ export async function buildProjectProfile(
     commits,
     lastCommit: last ? { hash: last.hash, message: last.message ?? '', ts: last.ts } : null,
     doc,
+    purposeSummary,
+    purposeBasis,
+    purposeReason,
   };
 }
 
@@ -419,6 +703,52 @@ interface DocInput {
   commits: number;
   lastCommit: { hash: string; message: string; ts: number } | null;
   recentCommits: string[];
+}
+
+/**
+ * No README and nothing the heuristics can carry: ask the local chat model to
+ * characterize the repo from bounded source evidence, exactly the way a coding
+ * agent skims a codebase — read the manifest and file headers, say the purpose,
+ * cite the files the read is grounded in. The prompt bans name-reading so the
+ * model cannot do the one thing the heuristic path is accused of.
+ */
+export async function deriveProjectPurpose(
+  config: BrainConfig,
+  evidence: PurposeEvidence,
+  projectName: string,
+): Promise<{ summary: string | null; basis: string[]; reason: string | null }> {
+  const models = await listOllamaModels(config.llm.ollamaUrl);
+  if (!models || !hasOllamaModel(models, config.llm.model)) {
+    return { summary: null, basis: [], reason: `model "${config.llm.model}" is not installed` };
+  }
+  const installed = resolveOllamaModel(models, config.llm.model) ?? config.llm.model;
+  const client = createOllamaLlm({
+    url: config.llm.ollamaUrl,
+    model: installed,
+    timeoutMs: config.llm.timeoutMs,
+  });
+  const generated = await client.generate(
+    'Source evidence from a repository named "' + projectName + '":\n\n' +
+      (evidence.rendered ?? '') +
+      '\n\nWrite 1 to 3 sentences: what is this software for and what does it do? ' +
+      'Ground every claim in the evidence above, and cite which files or manifest fields support it. ' +
+      'If the evidence is too thin or unclear, say exactly that instead of guessing. ' +
+      'Do not speculate from the repository name. Plain prose, no lists.',
+    {
+      system:
+        'You characterize a codebase from its manifest and source headers. ' +
+        'Report only what the evidence shows. When the evidence does not establish something, say so plainly.',
+      temperature: 0.2,
+      maxTokens: 300,
+    },
+  );
+  const text = generated.trim();
+  if (text.length < 40) return { summary: null, basis: [], reason: 'the model returned too little to use' };
+  return {
+    summary: excerpt(text, 500),
+    basis: evidence.snippets.map((snippet) => snippet.file).slice(0, 6),
+    reason: null,
+  };
 }
 
 /** The indexed text. Deliberately keyword-rich: this is what recall matches. */

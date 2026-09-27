@@ -525,7 +525,10 @@ export class BrainUiServer {
     const reports: Array<{ id: number; name: string; summary: string }> = [];
     for (const project of projects as ProjectRow[]) {
       const { setProjectMeta } = await import('../core/projects.js');
-      const profile = await buildProjectProfile(this.db, project);
+      const profile = await buildProjectProfile(this.db, project, {
+        useLlmPurpose: this.options.config.llm.provider !== 'none',
+        config: this.options.config,
+      });
       setProjectMeta(this.db, project.id, {
         stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
         summary: profile.summary,

@@ -353,7 +353,10 @@ export function registerMaintenanceCommands(program: Command): void {
           const reports: Array<{ id: number; name: string; summary: string; stack: string[]; commitsIndexed: number }> =
             [];
           for (const project of projects) {
-            const profile = await buildProjectProfile(db, project);
+            const profile = await buildProjectProfile(db, project, {
+              useLlmPurpose: config.llm.provider !== 'none',
+              config,
+            });
             setProjectMeta(db, project.id, {
               stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
               summary: profile.summary,

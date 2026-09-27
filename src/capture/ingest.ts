@@ -290,6 +290,11 @@ export interface OnboardOptions {
   installHook?: boolean;
   /** When provided, a running daemon is asked to start watching immediately. */
   config?: BrainConfig;
+  /**
+   * Let the local chat model derive a purpose when no README describes one.
+   * Default true (one bounded LLM call at registration); set false to skip it.
+   */
+  useLlmPurpose?: boolean;
 }
 
 export interface OnboardResult {
@@ -349,7 +354,10 @@ async function finishOnboard(
 ): Promise<OnboardResult> {
   const { project, created } = registerProject(db, folder, { name: options.name });
   const backfill = await backfillHistory(db, project, { limit: options.limit });
-  const profile = await buildProjectProfile(db, project);
+  const profile = await buildProjectProfile(db, project, {
+    useLlmPurpose: options.config?.llm.provider !== 'none' && (options.useLlmPurpose ?? true),
+    config: options.config,
+  });
 
   setProjectMeta(db, project.id, {
     stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
@@ -463,7 +471,11 @@ export async function connectProjectFolder(
 
   const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as ProjectRow;
   const backfill = await backfillHistory(db, project, {});
-  const profile = await buildProjectProfile(db, project);
+  const profile = await buildProjectProfile(db, project, {
+    useLlmPurpose: options.config?.llm.provider !== 'none',
+    purposeAttempted: true,
+    config: options.config,
+  });
   setProjectMeta(db, projectId, {
     stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
     summary: profile.summary,

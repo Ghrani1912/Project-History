@@ -11,7 +11,7 @@ import type { CommitRow, OwnerType, ProjectRow, SearchHit, TimelineEntry } from 
 import { commitSubject, isVagueSubject } from '../summarize/brief.js';
 import { hasOllamaModel, listOllamaModels, resolveOllamaModel } from '../embeddings/embedder.js';
 import { createOllamaLlm } from '../llm/ollama.js';
-import { buildProjectProfile, type ProjectProfile } from '../summarize/profile.js';
+import { buildProjectProfile, isGenericOverview, type ProjectProfile } from '../summarize/profile.js';
 import { log } from '../util/logger.js';
 import { plural, relativeTime, truncate } from '../util/format.js';
 
@@ -208,10 +208,31 @@ function listOf(items: string[], max: number): string {
   return `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`;
 }
 
+/** Re-exported so callers can share one definition of a "generic" overview. */
+export { isGenericOverview };
+
 /** "X is <stored overview>. It is built with A and B." */
-function identityParagraph(project: ProjectRow | null, overview: string | null, profile: ProjectProfile | null): string | null {
+function identityParagraph(
+  project: ProjectRow | null,
+  overview: string | null,
+  profile: ProjectProfile | null,
+  purposeSummary: string | null,
+  purposeBasis: string[],
+): string | null {
   if (overview) {
     const stack = profile && profile.stack.length > 0 ? ` It is built with ${listOf(profile.stack, 4)}.` : '';
+    if (isGenericOverview(overview)) {
+      if (purposeSummary) {
+        // The purpose was read out of the source itself; show the receipts.
+        const files = purposeBasis.length > 0 ? ` (read from ${listOf(purposeBasis.slice(0, 3), 3)})` : '';
+        return sentence(purposeSummary) + files + stack;
+      }
+      return (
+        sentence(overview) +
+        ' The overview on record describes the folder layout, not what the project is for.' +
+        stack
+      );
+    }
     return sentence(overview) + stack;
   }
   if (profile && profile.summary) return sentence(profile.summary);
@@ -432,9 +453,13 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
   }
 
   // Evidence the citations show. The workspace-overview passage is dropped when
-  // a stored overview exists, because that overview is what the answer explains
-  // with — otherwise every answer would cite itself.
-  const evidence = input.hits.filter((hit) => !(hit.ownerType === 'project' && overview !== null)).slice(0, 4);
+  // a stored overview exists and the passage adds nothing beyond it — otherwise
+  // every answer would cite itself. A passage that carries a README section is
+  // kept: the README rides inside the project document, and it is precisely the
+  // material "what does this project do / what models does it have" needs.
+  const evidence = input.hits
+    .filter((hit) => !(hit.ownerType === 'project' && overview !== null && !hit.text.includes('README:')))
+    .slice(0, 4);
 
   // Read the newest commits out of the local record (never by touching the
   // repository) so a "what did I last complete" question can quote one.
@@ -454,6 +479,35 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
 
   const profile = project && (overview === null || about) ? await safeProfile(db, project) : null;
 
+  // The fallback: when the stored overview is generic (no README said what this
+  // is for) and the profile does not already carry a derived purpose, read the
+  // repo the way a coding agent would — manifest plus source-file headers — and
+  // let the local chat model write a grounded purpose from that evidence. The
+  // result is not persisted here (register/refresh own that); it just upgrades
+  // this answer from "layout, no purpose" to a cited read of the source.
+  let purposeSummary: string | null = profile?.purposeSummary ?? null;
+  let purposeBasis: string[] = profile?.purposeBasis ?? [];
+  if (
+    project &&
+    isGenericOverview(overview) &&
+    !purposeSummary &&
+    (input.useLlm ?? true) &&
+    config.llm.provider !== 'none'
+  ) {
+    try {
+      const { collectPurposeEvidence, deriveProjectPurpose } = await import('../summarize/profile.js');
+      const derived = await deriveProjectPurpose(
+        config,
+        collectPurposeEvidence(project.path),
+        project.name,
+      );
+      purposeSummary = derived.summary;
+      purposeBasis = derived.basis;
+    } catch (err) {
+      log.debug(`answer: purpose fallback failed — ${String(err)}`);
+    }
+  }
+
   // The deterministic state line, and the phrase used to tell whether a model
   // answer already stated it. For a recency question the anchor is the newest
   // commit rather than the vaguest newest timeline entry.
@@ -468,7 +522,7 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
         : '';
 
   const paragraphs: string[] = [];
-  const identity = identityParagraph(project, overview, profile);
+  const identity = identityParagraph(project, overview, profile, purposeSummary, purposeBasis);
   const structure = structureParagraph(profile);
   if (onTopic) {
     if (completedQuestion) {
@@ -516,6 +570,9 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
         project ? `Workspace: ${project.name}` : 'Workspace: all projects',
         overview ? `Stored overview: ${overview}` : '',
         structure ? `Codebase: ${structure}` : '',
+        // The README is the one document that names modules and models; feed it
+        // to the writer explicitly rather than hoping a retrieval hit carries it.
+        profile?.readme ? `README excerpt: ${oneLine(profile.readme).slice(0, 1600)}` : '',
         newest ? `Most recent activity (${relativeTime(newest.ts)}): ${humanizeTimeline(newest)}` : '',
         lastCommits.length > 0 ? 'Recent commits (newest first):' : '',
         ...lastCommits.map(
@@ -548,8 +605,18 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
           ? `\n\nIdentity (authoritative, from the stored overview of ${project ? project.name : 'this workspace'}): ${overview}` +
             '\nAnswer from that overview. Do not infer what this project is from its commit messages or file names.'
           : '';
+      // A generic (fallback) overview plus a small model is exactly how "a
+      // monitoring tool for Active Directory, given its name and folders"
+      // gets written: the model reads purpose into names. With a generic
+      // overview the speculation licence is revoked explicitly — unless a
+      // derived purpose already exists, in which case the overview itself was
+      // written from the source and is fine to speak from.
+      const genericNote =
+        isGenericOverview(overview) && !purposeSummary
+          ? '\n\nThe stored overview for this workspace is generic — it only records the stack and folder layout, because no README prose was found. Do not guess or speculate what the project is for from its name, its folder names, or its file names. Say what the record actually shows (stack, layout, recent activity) and state plainly that the record does not say what the project is for.'
+          : '';
       const generated = await client.generate(
-        `${subject}${retrievalNote}\n\nContext:\n${context}\n\nQuestion: ${query}${identity}\n\nAnswer:`,
+        `${subject}${retrievalNote}\n\nContext:\n${context}\n\nQuestion: ${query}${identity}${genericNote}\n\nAnswer:`,
         {
           system:
             'You are the recall layer of a local second brain, answering questions about the user\'s own software project. ' +

@@ -127,6 +127,16 @@ export function renderPage(token: string): string {
     background: var(--surf-high); color: var(--outline); flex: none;
   }
   .ws.active .ws-tag { color: var(--secondary); }
+  .ws-actions { display: flex; align-items: center; gap: 2px; flex: none; }
+  /* Unregister sits on every row, revealed on hover so the sidebar stays
+     clean but the control is one click away on the row itself. */
+  .ws-x {
+    border: none; background: transparent; color: var(--outline); cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 3px 6px; border-radius: 5px; opacity: 0;
+    transition: opacity .12s ease;
+  }
+  .ws:hover .ws-x, .ws.active .ws-x { opacity: .75; }
+  .ws-x:hover { opacity: 1; background: #3a1414; color: var(--error); }
   .ws-ro {
     font-family: var(--mono); font-size: 8.5px; padding: 1px 4px; border-radius: 4px;
     background: #33290f; color: #ffd479; margin-left: 5px; vertical-align: 1px;
@@ -496,6 +506,31 @@ var timelineData = {};
 var timelineInfo = {};
 var timelinePending = {};
 var timelineWidened = {};
+// The 20s state poll used to rebuild the sidebar and the whole detail panel
+// every tick, which read as the page reloading: typed text vanished, the
+// timeline search box emptied, scroll jumped. These signatures remember what
+// is on screen so a poll that learned nothing new touches nothing.
+var lastSidebarSig = '';
+var lastDetailSig = '';
+var lastWarningsSig = null;
+
+function projectSig(p) {
+  return [p.id, p.name, p.summary || '', p.stack || '', p.events, p.commits, p.decisions, p.briefs,
+    p.watched ? 1 : 0, p.hook ? 1 : 0, p.exists ? 1 : 0, p.lastSeenAt || 0].join('|');
+}
+function sidebarSig() {
+  if (!state) return '';
+  return state.projects.map(projectSig).join(';') + '#' + current;
+}
+function detailSig(p) {
+  return projectSig(p) + '#' + tab + '#' + (state.llm.ready ? 1 : 0) + '#' + (state.daemon.running ? 1 : 0);
+}
+function typingInDetail() {
+  var active = document.activeElement;
+  var detail = el('detail');
+  return Boolean(active && detail && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA') &&
+    detail.contains(active));
+}
 
 function api(url, options) {
   options = options || {};
@@ -588,6 +623,7 @@ function askFromButton(button) { runAsk(Number(button.getAttribute('data-project
 function askOnEnter(event) { if (event.key === 'Enter') runAsk(Number(event.target.getAttribute('data-project'))); }
 function refreshFromButton(button) { refreshProject(Number(button.getAttribute('data-project'))); }
 function unregisterFromButton(button) { unregisterProject(Number(button.getAttribute('data-project'))); }
+function unregisterFromSidebar(button) { unregisterProject(Number(button.getAttribute('data-project'))); }
 function briefFromButton(button) { loadBrief(Number(button.getAttribute('data-project')), false); }
 function checkFromButton(button) { runCheck(Number(button.getAttribute('data-project'))); }
 function checkOnEnter(event) {
@@ -730,12 +766,16 @@ function loadState() {
     put('footTotals', t.decisions + ' decisions · ' + t.briefs + ' briefs' +
       (hygieneBits.length ? ' · ' + hygieneBits.join(' · ') : ''));
     syncDaemonButtons(daemon);
-    if (data.warnings && data.warnings.length) {
-      put('warnings', '<div class="warnbox"><b>Capture health</b><ul>' + data.warnings.map(function (w) {
-        return '<li>' + esc(w) + '</li>';
-      }).join('') + '</ul></div>');
-    } else {
-      put('warnings', '');
+    var warnKey = (data.warnings || []).join('~');
+    if (warnKey !== lastWarningsSig) {
+      lastWarningsSig = warnKey;
+      if (warnKey) {
+        put('warnings', '<div class="warnbox"><b>Capture health</b><ul>' + data.warnings.map(function (w) {
+          return '<li>' + esc(w) + '</li>';
+        }).join('') + '</ul></div>');
+      } else {
+        put('warnings', '');
+      }
     }
     renderProjects();
     if (current === null && data.projects.length) {
@@ -748,7 +788,13 @@ function loadState() {
     }
     if (current !== null) {
       var still = data.projects.filter(function (p) { return p.id === current; })[0];
-      if (still) renderDetail(still);
+      if (still) {
+        // Rebuild only when something about this workspace actually changed,
+        // and never under a focused input — mid-sentence text must survive a
+        // background poll.
+        var sig = detailSig(still);
+        if (sig !== lastDetailSig && !typingInDetail()) renderDetail(still);
+      }
       else { current = null; put('detail', '<div class="empty">Pick a workspace on the left.</div>'); }
     }
   }).catch(function (err) {
@@ -764,6 +810,9 @@ function loadState() {
 
 function renderProjects() {
   if (!state) return;
+  var sig = sidebarSig();
+  if (sig === lastSidebarSig) return;
+  lastSidebarSig = sig;
   renderTopNav();
   if (!state.projects.length) {
     put('wsCount', '0');
@@ -779,6 +828,8 @@ function renderProjects() {
       '<div class="ws-name"><span class="ws-dot ' + dotCls + '"></span><span>' + esc(p.name) +
       (p.recallOnly ? ' <span class="ws-ro" title="recall-only: registered from a git link, no live capture">RO</span>' : '') +
       '</span></div>' +
+      '<span class="ws-actions"><button class="ws-x" title="Unregister ' + esc(p.name) +
+      '" onclick="event.stopPropagation(); unregisterFromSidebar(this)" data-project="' + p.id + '">✕</button></span>' +
       '<span class="ws-tag">' + tag + '</span></div>';
   }).join(''));
 }
@@ -799,6 +850,7 @@ function selectProject(id) {
 }
 
 function renderDetail(project) {
+  lastDetailSig = detailSig(project);
   put('crumbName', esc(project.name));
   put('statContext', 'Auto-indexing active workspace ' + esc(project.name));
   renderTopNav();
