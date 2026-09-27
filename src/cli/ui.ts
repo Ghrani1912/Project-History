@@ -23,7 +23,7 @@ export function registerUiCommands(program: Command): void {
         keyValue('port', port);
         out('');
         heading('What you can do here');
-        bullet('type or browse to a folder and press "Register folder" — no CLI needed');
+        bullet('paste a folder path or a git link into "Track a folder" — a folder captures live, a link is cloned for recall');
         bullet('see every project with the stack, summary and capture counts it stored');
         bullet('generate a brief, read the timeline, and ask questions across your memory');
         bullet('start/stop the daemon and install shell hooks when capture goes quiet');

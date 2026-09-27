@@ -11,7 +11,9 @@ import { openDatabase, type Db } from '../db/index.js';
 import { createEmbedder, type Embedder } from '../embeddings/embedder.js';
 import { countEmbeddings } from '../embeddings/store.js';
 import { writeCliShim } from './shellHook.js';
-import { daemonFile, logPath, pidPath, shellEnvFile } from '../util/paths.js';
+import { claimDaemonRecord } from './daemonGuard.js';
+import { isProcessAlive, pingPort } from './client.js';
+import { brainHome, daemonFile, logPath, pidPath, shellEnvFile } from '../util/paths.js';
 import { log } from '../util/logger.js';
 import {
   indexProjectCommits,
@@ -67,6 +69,7 @@ export class CaptureServer {
   private server: net.Server | null = null;
   private syncTimer: NodeJS.Timeout | null = null;
   private chatTimer: NodeJS.Timeout | null = null;
+  private driftTimer: NodeJS.Timeout | null = null;
   private port = 0;
 
   constructor(private readonly options: ServerOptions) {
@@ -110,22 +113,42 @@ export class CaptureServer {
 
     const basePort = this.options.config.port;
     this.port = await this.listen(server, basePort);
-    fs.writeFileSync(
-      daemonFile(),
-      JSON.stringify(
-        {
-          pid: process.pid,
-          port: this.port,
-          host: '127.0.0.1',
-          token: this.token,
-          startedAt: this.startedAt,
-          version: `${PROTOCOL_VERSION}`,
-        } satisfies DaemonRecord,
-        null,
-        2,
-      ),
-      'utf8',
-    );
+    const record: DaemonRecord = {
+      pid: process.pid,
+      port: this.port,
+      host: '127.0.0.1',
+      token: this.token,
+      startedAt: this.startedAt,
+      version: `${PROTOCOL_VERSION}`,
+    };
+    // One daemon per home. Publishing the record exclusively is what makes that
+    // true: without it a second daemon would bind the next free port, overwrite
+    // this record and leave the first one running and unreachable.
+    if (!claimDaemonRecord(record)) {
+      const holder = readDaemonRecord();
+      // Refuse only when the record can be *positively identified* as live: the
+      // port answers, and the pid answering is the pid the record names.
+      //
+      // Both weaker checks are wrong. A plain ping answers the record holder's
+      // own port, so after a crash — when that port is free and this process has
+      // just re-bound it — the ping comes back from ourselves and a dead record
+      // looks alive (the restart then dies reporting the dead pid as "started").
+      // Liveness alone is wrong too: a crashed daemon's pid can be reused by an
+      // unrelated process, which would make a stale record refuse forever.
+      const reply = holder ? await pingPort(holder.port) : null;
+      if (holder && reply && reply.pid === holder.pid && isProcessAlive(holder.pid)) {
+        await this.abandonStart();
+        throw new Error(
+          `another daemon is already serving this brain home (pid ${holder.pid}, port ${holder.port})`,
+        );
+      }
+      // The claim is stale — nothing identified itself as its holder — so take it over.
+      fs.rmSync(daemonFile(), { force: true });
+      if (!claimDaemonRecord(record)) {
+        await this.abandonStart();
+        throw new Error('could not claim the daemon record');
+      }
+    }
     fs.writeFileSync(pidPath(), String(process.pid), 'utf8');
     // Shell-sourceable credentials for the fast path (no JSON parsing in shell).
     fs.writeFileSync(
@@ -150,6 +173,7 @@ export class CaptureServer {
     }
 
     this.scheduleChatIngestion();
+    this.scheduleContradictionScan();
 
     log.info(`daemon listening on 127.0.0.1:${this.port}`);
     return this.port;
@@ -178,6 +202,29 @@ export class CaptureServer {
     this.chatTimer.unref();
   }
 
+  /**
+   * The contradiction detector runs in the background: decisions drift apart
+   * slowly, so a periodic scan is what catches "I said SQLite here but Postgres
+   * there" months later without anyone remembering to look.
+   */
+  private scheduleContradictionScan(): void {
+    if (!this.options.config.contradictions.enabled) return;
+    const intervalMs = Math.max(1, this.options.config.contradictions.intervalMinutes) * 60_000;
+    const run = async (): Promise<void> => {
+      try {
+        const { detectContradictions, persistContradictions } = await import('../core/contradictions.js');
+        const found = detectContradictions(this.db, {});
+        const inserted = persistContradictions(this.db, found);
+        if (inserted > 0) log.info(`contradiction scan: ${inserted} new conflict(s)`);
+      } catch (err) {
+        log.debug(`contradiction scan failed: ${String(err)}`);
+      }
+    };
+    void run();
+    this.driftTimer = setInterval(() => void run(), intervalMs);
+    this.driftTimer.unref();
+  }
+
   private listen(server: net.Server, preferredPort: number): Promise<number> {
     return new Promise((resolve, reject) => {
       const tryPort = (port: number, attemptsLeft: number): void => {
@@ -198,9 +245,26 @@ export class CaptureServer {
     });
   }
 
+  /**
+   * Release the socket and the database after a refused start. The record is
+   * deliberately left alone: it belongs to the daemon that is already serving
+   * this home.
+   */
+  private async abandonStart(): Promise<void> {
+    const server = this.server;
+    this.server = null;
+    if (server) await new Promise<void>((resolve) => server.close(() => resolve()));
+    try {
+      this.db.close();
+    } catch {
+      // Already closed.
+    }
+  }
+
   async stop(): Promise<void> {
     if (this.syncTimer) clearInterval(this.syncTimer);
     if (this.chatTimer) clearInterval(this.chatTimer);
+    if (this.driftTimer) clearInterval(this.driftTimer);
     await this.watcher.close();
     await new Promise<void>((resolve) => {
       if (!this.server) return resolve();
@@ -282,6 +346,7 @@ export class CaptureServer {
           cwd: payload.cwd,
           cmd: payload.cmd ?? payload.text ?? '',
           exitCode: payload.exitCode ?? 0,
+          output: payload.output ?? null,
           ts: payload.ts,
           source: payload.source,
           sessionId: payload.sessionId ?? null,
@@ -309,7 +374,10 @@ export class CaptureServer {
     }
     switch (message.op) {
       case 'ping':
-        return { version: PROTOCOL_VERSION, pid: process.pid };
+        // The home is reported so a daemon found by the port sweep can be
+        // attributed to it: pinging needs no token, so this is the only
+        // information a caller can rely on before touching the process.
+        return { version: PROTOCOL_VERSION, pid: process.pid, home: brainHome() };
       case 'status':
         return this.status();
       case 'capture':

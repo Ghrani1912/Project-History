@@ -74,12 +74,60 @@ export function request<T = unknown>(
   });
 }
 
+/**
+ * Whether a pid exists and could be signalled (EPERM means it exists but is
+ * somebody else's). Used to tell a *live* record from a stale one without
+ * pinging it — after a crash the port may already have been re-bound by the
+ * process doing the asking, and a ping would then answer from ourselves.
+ */
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 export async function pingDaemon(record?: DaemonRecord, timeoutMs = 800): Promise<boolean> {
   try {
     const res = await request('ping', undefined, { record: record ?? undefined, timeoutMs });
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Ping a port with no recorded token.
+ *
+ * `ping` is the unauthenticated op by design (it is how a shell hook checks the
+ * daemon is up before sending anything), and that is what makes discovery
+ * possible: a daemon whose record was overwritten by a later start can still be
+ * identified by sweeping the port range. Returns null when nothing — or nothing
+ * speaking this protocol — answers.
+ */
+export async function pingPort(
+  port: number,
+  timeoutMs = 250,
+): Promise<{ pid: number; home: string | null; version: string | null } | null> {
+  const probe: DaemonRecord = { pid: 0, port, host: '127.0.0.1', token: '', startedAt: 0, version: '' };
+  try {
+    const res = await request<{ pid?: unknown; home?: unknown; version?: unknown }>('ping', undefined, {
+      record: probe,
+      timeoutMs,
+    });
+    if (!res.ok || !res.result) return null;
+    const pid = Number(res.result.pid ?? 0);
+    if (!Number.isFinite(pid) || pid <= 0) return null;
+    return {
+      pid,
+      home: typeof res.result.home === 'string' ? res.result.home : null,
+      version: typeof res.result.version === 'string' ? res.result.version : null,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -122,7 +170,10 @@ async function waitForDaemon(timeoutMs = 5000): Promise<DaemonRecord | null> {
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 120));
     const record = readDaemonRecord();
-    if (record && (await pingDaemon(record))) return record;
+    // The pid has to be alive too: while a restarting daemon holds the port but
+    // has not published its own record yet, a ping can answer from that very
+    // process and the stale record would look like a successful start.
+    if (record && isProcessAlive(record.pid) && (await pingDaemon(record))) return record;
   }
   return null;
 }

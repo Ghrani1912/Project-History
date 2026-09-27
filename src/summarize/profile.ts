@@ -322,7 +322,9 @@ export function describeProject(input: {
   const dirs = input.topLevel.filter((entry) => entry.kind === 'dir').map((entry) => entry.name.replace(/\/$/, ''));
   const stack = input.stack.length > 0 ? input.stack.join(', ') : input.languages[0]?.language ?? 'unknown stack';
   const shape = dirs.length > 0 ? ` with ${dirs.slice(0, 5).join(', ')}` : '';
-  return `${input.name} — a ${stack} project${shape}.`;
+  // "unknown stack" starts with a vowel sound, so it reads "an unknown stack
+  // project" — the same rule the state narrative applies.
+  return `${input.name} — ${stack === 'unknown stack' ? 'an' : 'a'} ${stack} project${shape}.`;
 }
 
 export interface BuildProfileOptions {

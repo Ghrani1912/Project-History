@@ -14,6 +14,14 @@ import {
   recordRepoCommits,
 } from '../capture/ingest.js';
 import { splitLine } from '../capture/shellHook.js';
+import {
+  agree,
+  daemonSituation,
+  describeDaemons,
+  strayWarning,
+  stopDaemonsForHome,
+  stopLeftoverDaemons,
+} from '../capture/daemonGuard.js';
 import { logPath } from '../util/paths.js';
 import { action, createContext, getEmbedder } from './context.js';
 import { c, heading, keyValue, ok, out, printJson, warn } from './output.js';
@@ -38,20 +46,53 @@ export function registerDaemonCommands(program: Command): void {
     .option('--json', 'machine-readable output')
     .action(
       action(async (options: { foreground?: boolean; json?: boolean }) => {
-        const existing = readDaemonRecord();
-        if (existing && (await pingDaemon(existing))) {
+        const config = loadConfig();
+        // Adopting a daemon that is already serving this home is the point of the
+        // guard: it is doing the job, and a second one would watch the same folders
+        // twice while taking over the record the first one is reachable through.
+        const situation = await daemonSituation(config);
+        if (situation.recorded) {
+          const active = situation.recorded;
           if (options.json) {
-            printJson({ alreadyRunning: true, port: existing.port, pid: existing.pid });
+            printJson({
+              alreadyRunning: true,
+              port: active.port,
+              pid: active.pid,
+              extras: situation.unreachable.map((daemon) => daemon.pid),
+              unattributed: situation.unattributed.map((daemon) => daemon.pid),
+            });
             return;
           }
-          ok(`daemon already running (pid ${existing.pid}, port ${existing.port})`);
+          ok(`daemon already running (pid ${active.pid}, port ${active.port})`);
+          if (situation.unreachable.length > 0) {
+            warn(strayWarning(situation.unreachable, 'stop'));
+          }
+          if (situation.unattributed.length > 0) {
+            warn(`also answering: ${describeDaemons(situation.unattributed)} — see brain daemon status`);
+          }
           return;
         }
-        const config = loadConfig();
+        // A daemon serving this home that the record does not describe cannot be
+        // adopted: its token is not in `daemon.json`, so the shell hook has
+        // nothing to authenticate with and capture would stay broken while it
+        // runs. Replacing it is what "start" is for.
+        if (situation.unreachable.length > 0) {
+          warn(
+            `${describeDaemons(situation.unreachable)} ${agree(situation.unreachable, 'is serving', 'are serving')} this home, but daemon.json does not describe ${agree(situation.unreachable, 'it', 'them')} — the shell hooks have no token for ${agree(situation.unreachable, 'it', 'them')}, so ${agree(situation.unreachable, 'it is', 'they are')} being replaced`,
+          );
+          await stopDaemonsForHome(config);
+        }
+        if (situation.unattributed.length > 0) {
+          warn(`daemon(s) answering without reporting this home: ${describeDaemons(situation.unattributed)}`);
+        }
         if (options.foreground) {
           const server = new CaptureServer({ config });
           const port = await server.start();
+          const leftovers = await stopLeftoverDaemons(config, process.pid);
           out(`daemon listening on 127.0.0.1:${port} ${c.grey(`(ctrl-c to stop, log: ${logPath()})`)}`);
+          if (leftovers.length > 0) {
+            out(c.grey(`  stopped ${leftovers.length} leftover ${leftovers.length === 1 ? 'daemon' : 'daemons'} that were serving the same home`));
+          }
           const shutdown = async (): Promise<void> => {
             await server.stop();
             process.exit(0);
@@ -62,38 +103,49 @@ export function registerDaemonCommands(program: Command): void {
         }
         startDaemonDetached();
         const { port, pid } = await waitForDaemonOrThrow();
+        // Whoever was already watching this home without a record is a leftover
+        // now that this daemon owns it.
+        const leftovers = await stopLeftoverDaemons(config, pid);
         if (options.json) {
-          printJson({ started: true, port, pid });
+          printJson({ started: true, port, pid, stoppedLeftovers: leftovers });
           return;
         }
         ok(`daemon started (pid ${pid}, port ${port})`);
+        if (leftovers.length > 0) {
+          out(c.grey(`  stopped ${leftovers.length} leftover ${leftovers.length === 1 ? 'daemon' : 'daemons'} that were serving the same home`));
+        }
         keyValue('log', logPath());
       }),
     );
 
   daemon
     .command('stop')
-    .description('Stop the capture daemon')
+    .description('Stop the capture daemon (every daemon serving this home)')
+    .option('--force', "also stop daemons that did not report this home (a leftover from an older version)")
     .option('--json', 'machine-readable output')
     .action(
-      action(async (options: { json?: boolean }) => {
-        const record = readDaemonRecord();
-        if (!record) {
-          if (options.json) printJson({ stopped: false, reason: 'not running' });
-          else out('daemon is not running');
+      action(async (options: { force?: boolean; json?: boolean }) => {
+        const config = loadConfig();
+        const report = await stopDaemonsForHome(config, { force: options.force });
+        if (options.json) {
+          printJson({
+            stopped: report.stopped.length > 0,
+            pids: report.stopped,
+            left: report.left.map((daemon) => daemon.pid),
+            untouched: report.untouched.map((daemon) => daemon.pid),
+          });
           return;
         }
-        try {
-          await request('shutdown', undefined, { record, timeoutMs: 3000 });
-        } catch {
-          try {
-            process.kill(record.pid);
-          } catch {
-            // Already gone.
-          }
+        if (report.stopped.length > 0) {
+          ok(`daemon stopped (${report.stopped.map((pid) => `pid ${pid}`).join(', ')})`);
+        } else {
+          out('daemon is not running');
         }
-        if (options.json) printJson({ stopped: true, pid: record.pid });
-        else ok(`daemon stopped (pid ${record.pid})`);
+        if (report.left.length > 0) warn(`could not stop: ${describeDaemons(report.left)}`);
+        if (report.untouched.length > 0) {
+          warn(`${describeDaemons(report.untouched)} answered without reporting this home`);
+          out(c.grey('  stop them with: brain daemon stop --force'));
+        }
       }),
     );
 
@@ -103,16 +155,47 @@ export function registerDaemonCommands(program: Command): void {
     .option('--json', 'machine-readable output')
     .action(
       action(async (options: { json?: boolean }) => {
+        const config = loadConfig();
         const record = readDaemonRecord();
+        // A home should have exactly one daemon; anything else answering in the
+        // port range is worth naming, because `stop` has to reach all of them.
+        const situation = await daemonSituation(config);
+        const extras = situation.unreachable;
+        const strays = {
+          extras: extras.map((d) => d.pid),
+          unattributed: situation.unattributed.map((d) => d.pid),
+        };
+        const reportExtras = (): void => {
+          if (extras.length > 0) warn(strayWarning(extras, 'stop'));
+          if (situation.unattributed.length > 0) {
+            warn(
+              `${describeDaemons(situation.unattributed)} answered without reporting this home (started before the guard) — stop ${agree(situation.unattributed, 'it', 'them')} with: brain daemon stop --force`,
+            );
+          }
+        };
         if (!record) {
-          if (options.json) printJson({ running: false });
+          const serving = situation.mine.length + situation.unattributed.length;
+          if (options.json) {
+            printJson({
+              running: false,
+              pids: situation.mine.map((d) => d.pid),
+              unattributed: situation.unattributed.map((d) => d.pid),
+            });
+            return;
+          }
+          if (serving > 0) {
+            warn(
+              `no daemon record, but ${serving} ${serving === 1 ? 'daemon is' : 'daemons are'} serving this home — run: brain daemon start`,
+            );
+          }
           else warn('daemon is not running');
+          reportExtras();
           return;
         }
         try {
           const res = await request<Record<string, unknown>>('status', undefined, { record });
           if (options.json) {
-            printJson({ running: true, ...res.result });
+            printJson({ running: true, ...res.result, ...strays });
             return;
           }
           heading(`daemon running (pid ${record.pid}, port ${record.port})`);
@@ -120,9 +203,11 @@ export function registerDaemonCommands(program: Command): void {
           for (const [key, value] of Object.entries(result)) {
             keyValue(key, Array.isArray(value) ? value.join(', ') : String(value));
           }
+          reportExtras();
         } catch (err) {
-          if (options.json) printJson({ running: false, error: String(err) });
+          if (options.json) printJson({ running: false, error: String(err), ...strays });
           else warn(`daemon record exists but the daemon is unreachable: ${String(err)}`);
+          reportExtras();
         }
       }),
     );
@@ -132,22 +217,21 @@ export function registerDaemonCommands(program: Command): void {
     .description('Restart the daemon')
     .action(
       action(async () => {
-        const record = readDaemonRecord();
-        if (record) {
-          try {
-            await request('shutdown', undefined, { record, timeoutMs: 3000 });
-          } catch {
-            try {
-              process.kill(record.pid);
-            } catch {
-              // ignore
-            }
-          }
-          await new Promise((resolve) => setTimeout(resolve, 400));
-        }
+        const config = loadConfig();
+        // Restart means this home ends up with exactly one daemon: stop every
+        // one it has (including duplicates), then start a fresh one.
+        const report = await stopDaemonsForHome(config);
+        if (report.stopped.length > 0) await new Promise((resolve) => setTimeout(resolve, 400));
         startDaemonDetached();
         const { port, pid } = await waitForDaemonOrThrow();
+        const leftovers = await stopLeftoverDaemons(config, pid);
         ok(`daemon restarted (pid ${pid}, port ${port})`);
+        if (leftovers.length > 0) {
+          out(c.grey(`  stopped ${leftovers.length} leftover ${leftovers.length === 1 ? 'daemon' : 'daemons'} that were serving the same home`));
+        }
+        if (report.untouched.length > 0) {
+          warn(`${describeDaemons(report.untouched)} answered without reporting this home — stop them with: brain daemon stop --force`);
+        }
       }),
     );
 

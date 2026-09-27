@@ -73,13 +73,22 @@ export function countEvents(db: Db, projectId: number | null = null): number {
 }
 
 /** Human-readable one-liner for an event, used by timelines and briefs. */
-export function describeEvent(event: EventRow): string {
-  let payload: Record<string, unknown> = {};
+/** Parse an event payload, falling back to `{ raw }` for non-JSON rows. */
+export function eventPayload(event: EventRow): Record<string, unknown> {
   try {
-    payload = JSON.parse(event.payload) as Record<string, unknown>;
+    return JSON.parse(event.payload) as Record<string, unknown>;
   } catch {
-    payload = { raw: event.payload };
+    return { raw: event.payload };
   }
+}
+
+/** The command line an event carries, or '' when it has none. */
+export function eventCommand(event: EventRow): string {
+  return String(eventPayload(event).cmd ?? '').trim();
+}
+
+export function describeEvent(event: EventRow): string {
+  const payload = eventPayload(event);
   switch (event.type) {
     case 'cmd': {
       const cmd = String(payload.cmd ?? payload.raw ?? '').trim();
@@ -90,6 +99,17 @@ export function describeEvent(event: EventRow): string {
       const action = String(payload.action ?? 'change');
       const file = String(payload.path ?? '');
       return `${action} ${file}`;
+    }
+    case 'error': {
+      // A failed command plus the error output that followed it. The command
+      // and its exit code come first so "how did I fix this error" can match on
+      // the same words the terminal showed.
+      const cmd = String(payload.cmd ?? payload.raw ?? '').trim();
+      const code = event.exit_code ?? 0;
+      const raw = String(payload.output ?? '').replace(/\r/g, '');
+      const firstLine = raw.split(/\n/).find((line) => line.trim().length > 0) ?? '';
+      const hint = firstLine.replace(/\s+/g, ' ').trim().slice(0, 160);
+      return `! ${cmd}  (exit ${code})${hint ? `  → ${hint}` : ''}`;
     }
     case 'commit':
       return `commit ${String(payload.hash ?? '').slice(0, 7)}: ${String(payload.message ?? '').split('\n')[0]}`;

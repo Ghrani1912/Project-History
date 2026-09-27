@@ -41,14 +41,15 @@ function collect(db: Db, options: TimelineOptions): RawTimeline[] {
   const limit = options.limit ?? 200;
   const since = options.since ?? 0;
   const until = options.until ?? Number.MAX_SAFE_INTEGER;
-  const kinds = options.kinds ?? (['cmd', 'file', 'commit', 'chat', 'decision'] as const);
+  const kinds = options.kinds ?? (['cmd', 'file', 'commit', 'chat', 'decision', 'error'] as const);
   const want = new Set<string>(kinds);
   const out: RawTimeline[] = [];
 
-  if (want.has('cmd') || want.has('file')) {
+  if (want.has('cmd') || want.has('file') || want.has('error')) {
     const types: string[] = [];
     if (want.has('cmd')) types.push('cmd');
     if (want.has('file')) types.push('file');
+    if (want.has('error')) types.push('error');
     const filters = [`type IN (${types.map(() => '?').join(',')})`, 'ts >= ?', 'ts <= ?'];
     const params: unknown[] = [...types, since, until];
     if (projectId !== null) {
@@ -61,7 +62,7 @@ function collect(db: Db, options: TimelineOptions): RawTimeline[] {
       .all(...params) as EventRow[];
     for (const row of rows) {
       out.push({
-        kind: row.type === 'file' ? 'file' : 'cmd',
+        kind: row.type === 'file' ? 'file' : row.type === 'error' ? 'error' : 'cmd',
         ts: row.ts,
         projectId: row.project_id,
         text: describeEvent(row),

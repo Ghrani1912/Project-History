@@ -12,12 +12,15 @@
  *
  * Hard rules for the client script below, because it lives inside a TypeScript
  * template literal:
- *  - no backticks and no `${` (except the deliberate token injection),
+ *  - no backticks and no `${` (except the deliberate token and git-scheme
+ *    injections from renderPage's arguments/imports),
  *  - no backslash escapes of any kind (the template literal would eat them),
  *  - inline handlers take no arguments; they read `data-*` attributes instead,
  *    so no nested quote escaping is ever needed.
  * test/ui.test.ts compiles the emitted script with `vm.Script` to keep this honest.
  */
+import { GIT_URL_SCHEMES } from '../git/remote.js';
+
 export function renderPage(token: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -124,6 +127,10 @@ export function renderPage(token: string): string {
     background: var(--surf-high); color: var(--outline); flex: none;
   }
   .ws.active .ws-tag { color: var(--secondary); }
+  .ws-ro {
+    font-family: var(--mono); font-size: 8.5px; padding: 1px 4px; border-radius: 4px;
+    background: #33290f; color: #ffd479; margin-left: 5px; vertical-align: 1px;
+  }
   .side-foot {
     margin: 10px; padding: 12px; border-radius: 12px; background: rgba(24,28,34,.7);
     border: 1px solid #242931; display: flex; flex-direction: column; gap: 6px;
@@ -209,6 +216,17 @@ export function renderPage(token: string): string {
   .ghost:hover { color: var(--fg); border-color: var(--secondary); }
   .ghost.tiny { padding: 3px 7px; font-size: 11px; }
   .ghost.active { background: var(--primary-con); color: var(--on-primary-con); border-color: var(--primary-con); font-weight: 600; }
+  .btn[disabled] { opacity: .38; cursor: default; pointer-events: none; }
+  .toast {
+    position: fixed; right: 18px; bottom: 18px; z-index: 60;
+    background: var(--surf-con); border: 1px solid #2b3038; border-radius: 12px;
+    box-shadow: 0 12px 34px rgba(0,0,0,.5); padding: 12px 16px; max-width: 380px;
+    font-size: 12.5px;
+  }
+  .toast b { display: block; margin-bottom: 4px; }
+  .toast .mono { color: var(--fg2); }
+  .toast .toast-x { float: right; margin-left: 12px; cursor: pointer; color: var(--outline); }
+  .toast .toast-x:hover { color: var(--fg); }
   .ai-toggle { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--outline); margin: 4px 0 10px; }
   .ai-toggle input { accent-color: var(--primary-con); }
 
@@ -280,6 +298,7 @@ export function renderPage(token: string): string {
   .tl-node.decision span { background: var(--primary); }
   .tl-node.file span { background: var(--secondary); }
   .tl-node.chat span { background: var(--tertiary); }
+  .tl-node.error span { background: var(--error); }
   .tl-card {
     background: var(--surf-low); border: 1px solid #242931; border-radius: 12px;
     padding: 12px 14px; box-shadow: 0 1px 6px rgba(0,0,0,.25);
@@ -297,6 +316,7 @@ export function renderPage(token: string): string {
   .badge.decision { background: #10312f; color: #6ff0e6; }
   .badge.file { background: #1f2937; color: var(--fg2); }
   .badge.chat { background: #33290f; color: #ffd479; }
+  .badge.error { background: #3a1414; color: var(--error); }
   .tl-text { font-family: var(--mono); font-size: 12.5px; color: var(--fg); word-break: break-word; }
   .tl-text::before { content: "$ "; color: var(--secondary); }
   .tl-text.plain::before { content: none; }
@@ -339,6 +359,7 @@ export function renderPage(token: string): string {
     padding: 2px 7px; border-radius: 999px; background: var(--surf-high); color: var(--outline); }
   .tag.git { background: #14301c; color: var(--green); }
   .tag.reg { background: #16283d; color: var(--secondary); }
+  .tag.bad { background: #3a1414; color: var(--error); }
   .badge.project { background: #14301c; color: var(--green); }
 
   @media (max-width: 1240px) {
@@ -391,9 +412,9 @@ export function renderPage(token: string): string {
     <div class="top-actions">
       <span class="pill" id="pillDaemon"><span class="dot"></span><span>daemon …</span></span>
       <button class="btn" data-action="reload" onclick="daemonFromButton(this)">Refresh</button>
-      <button class="btn" data-action="daemon-start" onclick="daemonFromButton(this)">Start</button>
-      <button class="btn" data-action="daemon-stop" onclick="daemonFromButton(this)">Stop</button>
-      <button class="btn" data-action="install-hooks" onclick="daemonFromButton(this)">Hooks</button>
+      <button class="btn" id="btnDaemonStart" onclick="daemonFromButton(this)" data-action="daemon-start">Start</button>
+      <button class="btn" id="btnDaemonStop" onclick="daemonFromButton(this)" data-action="daemon-stop">Stop</button>
+      <button class="btn" id="btnHooks" onclick="daemonFromButton(this)" data-action="install-hooks">Hooks</button>
     </div>
   </header>
 
@@ -417,9 +438,10 @@ export function renderPage(token: string): string {
 
 <div class="modal hidden" id="registerModal">
   <div class="modal-panel">
-    <div class="modal-head"><h2>Track a folder</h2><button class="ghost" onclick="closeRegister()">✕</button></div>
-    <div class="row"><input type="text" id="folderPath" placeholder="C:/Users/me/projects/my-app" onkeydown="submitFolder(event)"></div>
-    <div class="row" style="margin-top:8px">
+    <div class="modal-head"><h2>Track a folder or git link</h2><button class="ghost" onclick="closeRegister()">✕</button></div>
+    <div class="row"><input type="text" id="folderPath" placeholder="C:/Users/me/projects/my-app  ·  https://github.com/owner/repo" onkeydown="submitFolder(event)" oninput="syncRegisterMode()"></div>
+    <div class="row" style="margin-top:6px"><span id="registerHint" class="muted small"></span></div>
+    <div class="row" style="margin-top:8px" id="browseRow">
       <button class="ghost" data-browse="typed" onclick="browseFromButton(this)">Browse…</button>
       <button class="ghost" data-browse="home" onclick="browseFromButton(this)">home</button>
       <span id="browsePath" class="muted mono small"></span>
@@ -427,7 +449,7 @@ export function renderPage(token: string): string {
     <div class="browser" id="browser"></div>
     <div class="row" style="margin-top:10px">
       <input type="text" id="folderName" placeholder="optional name">
-      <button class="btn primary" onclick="registerFolder()">Register folder</button>
+      <button class="btn primary" id="btnRegister" onclick="registerFolder()">Register folder</button>
     </div>
     <div id="registerReport"></div>
   </div>
@@ -451,6 +473,7 @@ export function renderPage(token: string): string {
 var TOKEN = '${token}';
 var TICK = String.fromCharCode(96);
 var NEWLINE = String.fromCharCode(10);
+var BS = String.fromCharCode(92);
 var homeDir = '';
 var state = null;
 var current = null;
@@ -524,8 +547,36 @@ function daemonFromButton(button) {
   var action = button.getAttribute('data-action');
   if (action === 'daemon-start') return startDaemon();
   if (action === 'daemon-stop') return stopDaemon();
-  if (action === 'install-hooks') return installHooks();
+  if (action === 'install-hooks') return installHooks(button);
   return loadState();
+}
+
+// Start/Stop/Hooks only make sense in one daemon state each, so the buttons
+// say so instead of accepting a click that does nothing.
+function syncDaemonButtons(daemon) {
+  var start = el('btnDaemonStart');
+  var stop = el('btnDaemonStop');
+  var hooks = el('btnHooks');
+  if (start) start.disabled = Boolean(daemon.running);
+  if (stop) stop.disabled = !daemon.running;
+  if (hooks) {
+    var installed = (state.shells && state.shells.hooks || []).some(function (h) { return h.installed; });
+    hooks.disabled = installed;
+    hooks.textContent = installed ? 'Hooks ✓' : 'Hooks';
+  }
+}
+
+// Inline confirmation for actions like hook installation — an alert() blocks
+// the page and cannot show which files changed, this can.
+function toast(html, ms) {
+  var old = el('brainToast');
+  if (old) old.remove();
+  var node = document.createElement('div');
+  node.id = 'brainToast';
+  node.className = 'toast';
+  node.innerHTML = '<span class="toast-x" onclick="this.parentNode.remove()">✕</span>' + html;
+  document.body.appendChild(node);
+  if (ms) setTimeout(function () { node.remove(); }, ms);
 }
 function selectFromCard(node) { selectProject(Number(node.getAttribute('data-project'))); }
 function tabFromButton(button) {
@@ -554,7 +605,11 @@ function copyText(button) {
   button.textContent = 'copied';
   setTimeout(function () { button.textContent = 'copy'; }, 1400);
 }
-function openRegister() { el('registerModal').classList.remove('hidden'); browse(''); }
+function openRegister() {
+  el('registerModal').classList.remove('hidden');
+  browse('');
+  syncRegisterMode();
+}
 function closeRegister() { el('registerModal').classList.add('hidden'); }
 function browseFromButton(button) {
   var mode = button.getAttribute('data-browse');
@@ -562,6 +617,30 @@ function browseFromButton(button) {
 }
 function browseEntry(node) { browse(node.getAttribute('data-path')); }
 function submitFolder(event) { if (event.key === 'Enter') registerFolder(); }
+// A git link registers a recall-only source (cloned for history and recall), so
+// the local folder picker has nothing to offer. Detecting the shape as you type
+// keeps the one dialog honest about which of the two paths you are on. The
+// schemes are injected from the server rule (this script cannot import it), and
+// test/ui.test.ts runs both over the same inputs so they cannot drift apart.
+var URL_RE = /^(?:(${GIT_URL_SCHEMES}):[/][/][^/]+[/][^ ]|(git|ssh)@)/i;
+function looksLikeUrl(value) {
+  return URL_RE.test(value.trim());
+}
+function syncRegisterMode() {
+  var url = looksLikeUrl(el('folderPath').value);
+  var browseRow = el('browseRow');
+  var browser = el('browser');
+  if (browseRow) browseRow.style.display = url ? 'none' : '';
+  if (browser) browser.style.display = url ? 'none' : '';
+  var button = el('btnRegister');
+  if (button) button.textContent = url ? 'Register git link' : 'Register folder';
+  var hint = el('registerHint');
+  if (hint) {
+    hint.textContent = url
+      ? 'Git link — cloned into the brain home for history and recall only; nothing is captured live.'
+      : 'Local folder — live capture: commands, errors, file touches and the commit hook.';
+  }
+}
 function openPalette() {
   el('palette').classList.remove('hidden');
   var input = el('paletteInput');
@@ -635,8 +714,22 @@ function loadState() {
     var t = data.totals;
     put('statFigs', '<span>' + t.projects + ' projects · ' + t.events + ' events · ' + t.commits +
       ' commits · ' + t.chatTurns + ' chat · ' + t.embeddings + ' vectors</span>');
-    put('dbSize', t.embeddings + ' vectors');
-    put('footTotals', t.decisions + ' decisions · ' + t.briefs + ' briefs');
+    // The footer is where a local-first tool should say where its data lives;
+    // the full paths are a hover away rather than crowding the sidebar.
+    var paths = 'home: ' + data.home + NEWLINE + 'database: ' + data.database + NEWLINE + 'config: ' + data.configFile;
+    put('dbSize', '<span title="' + attr(paths) + '">' + t.embeddings + ' vectors</span>');
+    var hygieneBits = [];
+    if (data.hygiene && data.hygiene.contradictions > 0) {
+      hygieneBits.push('<span class="dot warn"></span><span>' + data.hygiene.contradictions +
+        ' contradicting decision' + (data.hygiene.contradictions === 1 ? '' : 's') + '</span>');
+    }
+    if (data.hygiene && data.hygiene.openFailures > 0) {
+      hygieneBits.push('<span class="dot bad"></span><span>' + data.hygiene.openFailures +
+        ' open failure' + (data.hygiene.openFailures === 1 ? '' : 's') + '</span>');
+    }
+    put('footTotals', t.decisions + ' decisions · ' + t.briefs + ' briefs' +
+      (hygieneBits.length ? ' · ' + hygieneBits.join(' · ') : ''));
+    syncDaemonButtons(daemon);
     if (data.warnings && data.warnings.length) {
       put('warnings', '<div class="warnbox"><b>Capture health</b><ul>' + data.warnings.map(function (w) {
         return '<li>' + esc(w) + '</li>';
@@ -680,10 +773,13 @@ function renderProjects() {
   put('wsCount', state.projects.length + ' tracked');
   put('projects', state.projects.map(function (p) {
     var dotCls = p.watched ? 'ok' : (p.exists ? 'warn' : 'bad');
+    var tag = p.recallOnly ? 'ro' : p.commits + 'c';
     return '<div class="ws' + (p.id === current ? ' active' : '') + '" data-project="' + p.id +
       '" onclick="selectFromCard(this)">' +
-      '<div class="ws-name"><span class="ws-dot ' + dotCls + '"></span><span>' + esc(p.name) + '</span></div>' +
-      '<span class="ws-tag">' + p.commits + 'c</span></div>';
+      '<div class="ws-name"><span class="ws-dot ' + dotCls + '"></span><span>' + esc(p.name) +
+      (p.recallOnly ? ' <span class="ws-ro" title="recall-only: registered from a git link, no live capture">RO</span>' : '') +
+      '</span></div>' +
+      '<span class="ws-tag">' + tag + '</span></div>';
   }).join(''));
 }
 
@@ -709,6 +805,7 @@ function renderDetail(project) {
   var brief = briefHtml(project);
   var context = contextHtml(project);
   var timeline = timelineHtml(project);
+  var hygiene = hygieneHtml();
   if (tab === 'brief') {
     put('detail', '<div class="split single"><div class="col-left">' + brief + context + '</div></div>');
   } else if (tab === 'related') {
@@ -719,7 +816,8 @@ function renderDetail(project) {
     put('detail', '<div class="split single"><div class="col-left">' + askHtml(project) + '</div></div>');
   } else {
     put('detail', '<div class="split"><div class="col-left">' + brief + context + '</div>' +
-      '<div class="col-right">' + timeline + '</div></div>');
+      '<div class="col-right">' + timeline + hygiene + '</div></div>');
+    loadHygiene();
   }
   syncFilterButtons();
   if (tab === 'overview' || tab === 'brief') {
@@ -750,6 +848,57 @@ function renderDetail(project) {
       if (askBox) askBox.value = asked.query;
     }
   }
+}
+
+// ---- Memory hygiene: contradictions + open failures ----
+
+function hygieneHtml() {
+  return '<section class="card"><div class="card-head"><h2><span class="ico">⚖</span>Memory hygiene</h2>' +
+    '<span class="muted small">drift &amp; broken runs</span></div>' +
+    '<p class="muted small card-sub">What the record disagrees with itself about: decisions that conflict, ' +
+    'and commands that failed and were never re-run successfully.</p>' +
+    '<div id="hygieneBody"><div class="spin">Loading…</div></div></section>';
+}
+
+function loadHygiene() {
+  api('/api/hygiene').then(function (data) {
+    var parts = [];
+    if (data.contradictions.length === 0 && data.failures.length === 0) {
+      parts.push('<div class="muted small">Clean — no contradicting decisions and no unresolved failures on record.</div>');
+    }
+    for (const c of data.contradictions) {
+      parts.push('<div class="entry-line"><div><span class="tag bad">contradiction</span>' +
+        (c.project ? '<span class="badge project">' + esc(c.project) + '</span> ' : '') +
+        '<span class="badge">' + esc(c.category) + '</span>' +
+        '<span class="muted small"> score ' + c.score + '</span></div>' +
+        '<div class="mono">' + esc(c.a.text) + '</div>' +
+        '<div class="mono">' + esc(c.b.text) + '</div>' +
+        '<div class="muted small">' + esc(c.reason) + '</div>' +
+        '<div style="margin-top:5px"><button class="ghost tiny" data-dismiss="' + c.id +
+        '" onclick="dismissFromButton(this)">Dismiss — resolved</button></div></div>');
+    }
+    for (const f of data.failures) {
+      parts.push('<div class="entry-line"><div><span class="tag bad">still open</span>' +
+        (f.project ? '<span class="badge project">' + esc(f.project) + '</span> ' : '') +
+        '<span class="clock">' + rel(f.ts) + '</span></div>' +
+        '<div class="mono">$ ' + esc(f.cmd) + '</div>' +
+        (f.output ? '<div class="muted small">' + esc(f.output.split(NEWLINE).filter(function (l) { return l.trim(); })[0] || '') + '</div>' : '') +
+        '</div>');
+    }
+    put('hygieneBody', parts.join(''));
+  }).catch(function (err) {
+    put('hygieneBody', '<span class="bad">' + esc(err.message) + '</span>');
+  });
+}
+
+function dismissFromButton(button) {
+  api('/api/hygiene/dismiss', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id: Number(button.getAttribute('data-dismiss')) }) }).then(function () {
+    loadHygiene();
+    loadState();
+  }).catch(function (err) {
+    toast('<b class="bad">Could not dismiss</b><div class="dim">' + esc(err.message) + '</div>', 5000);
+  });
 }
 
 function metricsHtml(project) {
@@ -805,7 +954,51 @@ function checkHtml(project) {
     '" placeholder="add redis caching for the session lookup path" onkeydown="checkOnEnter(event)">' +
     '<button class="btn primary" data-project="' + project.id + '" onclick="checkFromButton(this)">Check plan</button></div>' +
     '<div id="checkBody" class="muted small" style="margin-top:8px">' +
-    'It also answers from the CLI: <code>brain check "add redis caching for the session lookup path"</code></div></div></section>';
+    'It also answers from the CLI: <code>brain check "add redis caching for the session lookup path"</code></div></div>' +
+    decisionHtml(project) + '</section>';
+}
+
+// Logging a decision from the panel is what keeps the two cards honest: this
+// one diffs plans against decisions and the hygiene card scans them for
+// conflicts, so both were telling you to open a terminal to write one.
+function decisionHtml(project) {
+  return '<div class="panel"><span class="panel-label">Log a decision</span>' +
+    '<div class="row"><input type="text" id="decisionInput" data-project="' + project.id +
+    '" placeholder="chose sqlite over postgres for the storage layer because it is embedded" ' +
+    'onkeydown="decisionOnEnter(event)">' +
+    '<button class="btn" data-project="' + project.id + '" onclick="logFromButton(this)">Log decision</button></div>' +
+    '<div id="decisionBody" class="muted small" style="margin-top:8px">Every "chose X over Y because Z" you ' +
+    'write here is what the plan check and the contradiction scan read back. #tags are pulled out of the text.</div></div>';
+}
+
+function decisionOnEnter(event) {
+  if (event.key === 'Enter') logDecision(Number(event.target.getAttribute('data-project')));
+}
+function logFromButton(button) { logDecision(Number(button.getAttribute('data-project'))); }
+function logDecision(id) {
+  var box = el('decisionInput');
+  var text = box ? box.value.trim() : '';
+  if (!text) {
+    put('decisionBody', '<span class="bad">Write it first — "chose X over Y because Z".</span>');
+    return;
+  }
+  put('decisionBody', '<div class="spin">Recording…</div>');
+  api('/api/decision', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project: id, text: text }) }).then(function (data) {
+    if (box) box.value = '';
+    // A new decision can contradict an older one, and any cached plan diff was
+    // computed without it — so both are invalidated rather than left stale.
+    delete checkCache[id];
+    // The refresh below re-renders the card, so the confirmation has to float
+    // above it rather than being written into a node that is about to be replaced.
+    toast('<b>Decision logged</b><div class="dim">' + esc(data.project) + ' now has ' + data.decisions +
+      ' decision' + (data.decisions === 1 ? '' : 's') + ' — Ask searches it immediately' +
+      (data.tags.length ? ', tagged ' + esc(data.tags.join(', ')) : '') + '.</div>', 5000);
+    loadHygiene();
+    loadState();
+  }).catch(function (err) {
+    put('decisionBody', '<span class="bad">' + esc(err.message) + '</span>');
+  });
 }
 
 function runCheck(id) {
@@ -829,8 +1022,8 @@ function checkReport(data) {
   if (data.verdict === 'clear') {
     if (data.considered === 0) {
       return '<div class="small"><b class="ok">clear</b> — nothing to compare yet: no decisions logged and no ' +
-        'reverts in git. Decisions are what this reads, so <code>brain log "chose X over Y because Z"</code> ' +
-        'is what makes it useful.</div>';
+        'reverts in git. Decisions are what this reads: log one in <b>Log a decision</b> above (or ' +
+        '<code>brain log "chose X over Y because Z"</code>) and this panel starts answering.</div>';
     }
     return '<div class="small"><b class="ok">clear</b> — nothing you logged contradicts this. Checked ' +
       data.considered + ' past decisions across ' + esc(data.scope) + '.</div>';
@@ -977,6 +1170,17 @@ function contextHtml(project) {
     ['watching', project.watched ? 'yes — the daemon is following this folder' : 'no — start the daemon'],
     ['commit hook', project.hook ? 'installed' : 'not installed']
   ];
+  var connectPanel = '';
+  if (project.recallOnly) {
+    connectPanel = '<div class="panel" style="margin-top:8px"><span class="panel-label">Connect a local folder</span>' +
+      '<div class="row"><input type="text" id="connectInput" data-project="' + project.id +
+      '" placeholder="C:' + BS + 'path' + BS + 'to' + BS + 'your' + BS + 'local' + BS + 'checkout" onkeydown="connectOnEnter(event)">' +
+      '<button class="btn primary" data-project="' + project.id + '" onclick="connectFromButton(this)">Connect</button></div>' +
+      '<div class="muted small" style="margin-top:6px">This project was registered from a git link, so it recalls ' +
+      'history but captures nothing. Point it at the folder where you actually work and the same record gains ' +
+      'commands, errors and file touches — no duplicate entry.</div>' +
+      '<div id="connectReport" class="muted small" style="margin-top:6px"></div></div>';
+  }
   return '<section class="card"><div class="card-head"><h2><span class="ico">🗂</span>Workspace context</h2>' +
     '<span class="row"><button class="ghost" data-project="' + project.id +
     '" onclick="refreshFromButton(this)">Re-scan</button>' +
@@ -985,9 +1189,30 @@ function contextHtml(project) {
     '<div class="panel"><span class="panel-label">Stored metadata</span><div class="kv">' +
     rows.map(function (pair) {
       return '<div class="k">' + esc(pair[0]) + '</div><div class="v">' + esc(pair[1]) + '</div>';
-    }).join('') + '</div></div>' +
+    }).join('') + '</div></div>' + connectPanel +
     '<div class="muted small" style="margin-top:10px">Stored on the project row at register time and indexed ' +
     'for recall. "Re-scan" refreshes it from the folder on disk.</div></section>';
+}
+
+function connectOnEnter(event) { if (event.key === 'Enter') connectFromButton(event.target); }
+
+function connectFromButton(button) {
+  var id = Number(button.getAttribute('data-project'));
+  var box = el('connectInput');
+  var folder = box ? box.value.trim() : '';
+  if (!folder) {
+    put('connectReport', '<span class="bad">Type or paste the local folder of this repository first.</span>');
+    return;
+  }
+  put('connectReport', '<span class="spin">Connecting and re-scanning…</span>');
+  api('/api/connect', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ project: id, folder: folder }) }).then(function (data) {
+    put('connectReport', '<span class="ok">Connected.</span> ' + data.commitsInserted +
+      ' commit(s) added from the folder' + (data.watched ? ' — capture is live.' : ' — start the daemon to capture.'));
+    loadState();
+  }).catch(function (err) {
+    put('connectReport', '<span class="bad">' + esc(err.message) + '</span>');
+  });
 }
 
 function askHtml(project) {
@@ -1062,7 +1287,7 @@ function runAsk(id) {
 }
 
 function timelineHtml(project) {
-  var kinds = [['all', 'All'], ['cmd', 'Commands'], ['commit', 'Commits'],
+  var kinds = [['all', 'All'], ['cmd', 'Commands'], ['error', 'Errors'], ['commit', 'Commits'],
     ['decision', 'Decisions'], ['file', 'File Touches'], ['chat', 'IDE Chats']];
   return '<section class="card"><div class="card-head"><h2><span class="ico">🗓</span>Unified Timeline</h2>' +
     '<span class="muted small">live capture</span></div>' +
@@ -1110,6 +1335,7 @@ function loadTimeline(id, span) {
 
 function kindLabel(kind) {
   if (kind === 'cmd') return 'Command';
+  if (kind === 'error') return 'Error';
   if (kind === 'commit') return 'Git Commit';
   if (kind === 'decision') return 'Decision';
   if (kind === 'file') return 'File Touch';
@@ -1127,7 +1353,7 @@ function timelineEntry(entry) {
     '<span class="grow"></span>' +
     '<button class="ghost tiny" data-copy="' + attr(entry.text) + '" onclick="copyText(this)">copy</button>' +
     '</div>' +
-    '<div class="tl-text' + (entry.kind === 'cmd' ? '' : ' plain') + '">' + esc(entry.text) + '</div>' +
+    '<div class="tl-text' + (entry.kind === 'cmd' || entry.kind === 'error' ? '' : ' plain') + '">' + esc(entry.text) + '</div>' +
     (entry.detail ? '<div class="tl-detail">' + esc(entry.detail) + '</div>' : '') +
     '</div></div>';
 }
@@ -1137,7 +1363,7 @@ function renderTimeline() {
   if (!body) return;
   var entries = current !== null ? timelineData[current] : null;
   if (!entries) { body.innerHTML = '<div class="spin">Loading…</div>'; return; }
-  var counts = { all: entries.length, cmd: 0, commit: 0, decision: 0, file: 0, chat: 0 };
+  var counts = { all: entries.length, cmd: 0, error: 0, commit: 0, decision: 0, file: 0, chat: 0 };
   entries.forEach(function (entry) { if (counts[entry.kind] !== undefined) counts[entry.kind]++; });
   var nodes = document.querySelectorAll('.chip-n');
   for (var i = 0; i < nodes.length; i++) {
@@ -1199,13 +1425,17 @@ function browse(target) {
       }));
     }
     put('browser', rows.length ? rows.join('') : '<div class="entry"><span class="muted">no subfolders</span></div>');
+    syncRegisterMode();
   }).catch(function (err) { put('browser', '<div class="entry bad">' + esc(err.message) + '</div>'); });
 }
 
 function registerFolder() {
   var path = el('folderPath').value.trim();
-  if (!path) { put('registerReport', '<div class="report bad">Enter or pick a folder first.</div>'); return; }
-  put('registerReport', '<div class="report spin">Scanning the folder, backfilling git history and indexing…</div>');
+  if (!path) { put('registerReport', '<div class="report bad">Enter or pick a folder, or paste a git link, first.</div>'); return; }
+  var url = looksLikeUrl(path);
+  put('registerReport', '<div class="report spin">' + (url
+    ? 'Cloning the repository, backfilling its history and indexing…'
+    : 'Scanning the folder, backfilling git history and indexing…') + '</div>');
   api('/api/register', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -1214,6 +1444,7 @@ function registerFolder() {
     var p = data.profile;
     var rows = [
       ['project', data.project.name + ' (id ' + data.project.id + ')'],
+      ['capture', data.recallOnly ? 'recall-only (git link) — history and recall, no live capture' : 'live (folder)'],
       ['summary', p.summary],
       ['stack', p.stack.join(', ') || 'unknown'],
       ['languages', p.languages.slice(0, 5).map(function (l) { return l.language + ' (' + l.files + ')'; }).join(', ') || 'none'],
@@ -1264,12 +1495,19 @@ function stopDaemon() {
   api('/api/daemon', { method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ action: 'stop' }) }).then(function () { setTimeout(loadState, 400); });
 }
-function installHooks() {
+function installHooks(button) {
+  if (button) button.disabled = true;
   api('/api/shell/install', { method: 'POST' }).then(function (data) {
-    var lines = data.shells.map(function (s) { return s.shell + ' -> ' + s.rcFile; });
-    window.alert('Installed capture hooks:' + NEWLINE + lines.join(NEWLINE) + NEWLINE + NEWLINE +
-      'Open a new terminal so the hooks load.');
+    var lines = data.shells.map(function (s) {
+      return '<div class="mono">' + esc(s.shell) + ' → ' + esc(s.rcFile) +
+        (s.installed ? '' : ' <span class="dim">(already present)</span>') + '</div>';
+    });
+    toast('<b>Capture hooks installed</b>' + lines.join('') +
+      '<div class="dim" style="margin-top:6px">Open a new terminal so the hooks load.</div>', 0);
     loadState();
+  }).catch(function (err) {
+    if (button) button.disabled = false;
+    toast('<b class="bad">Could not install hooks</b><div class="dim">' + esc(err.message) + '</div>', 6000);
   });
 }
 

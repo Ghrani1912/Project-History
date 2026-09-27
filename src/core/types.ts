@@ -1,4 +1,4 @@
-export type EventType = 'cmd' | 'file' | 'commit' | 'chat' | 'decision';
+export type EventType = 'cmd' | 'file' | 'commit' | 'chat' | 'decision' | 'error';
 
 /**
  * Things that can be indexed for recall. `project` is the per-project overview
@@ -73,7 +73,7 @@ export interface BriefRow {
 }
 
 /** Kinds that can appear on the merged timeline. */
-export type TimelineKind = 'cmd' | 'file' | 'commit' | 'chat' | 'decision';
+export type TimelineKind = 'cmd' | 'file' | 'commit' | 'chat' | 'decision' | 'error';
 
 /** A normalised timeline entry merged across every capture source. */
 export interface TimelineEntry {
@@ -84,6 +84,20 @@ export interface TimelineEntry {
   detail?: string;
   source: string;
   refId: number;
+}
+
+export interface ContradictionRow {
+  id: number;
+  project_id: number | null;
+  a_id: number;
+  b_id: number;
+  category: string;
+  choice_a: string;
+  choice_b: string;
+  score: number;
+  reason: string;
+  detected_at: number;
+  dismissed: number;
 }
 
 export interface SearchHit {

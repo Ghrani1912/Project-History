@@ -68,6 +68,7 @@ Run `brain info` for orientation and `brain doctor` when capture looks wrong.
 | Source | How | Where it lands |
 | --- | --- | --- |
 | Shell commands | bash DEBUG trap, zsh `preexec`+`precmd`, PowerShell `PSReadLine` + prompt wrapper — all written straight to the daemon socket | `events` (type `cmd`, with cwd + exit code) |
+| Error output | `brain run "<command>"`, or any capture client that sends an `output` field; a failed command with output is stored as its own class | `events` (type `error`, with exit code + output tail) |
 | Project profile | built on register/refresh: stack, languages, layout, entry points, README excerpt, remote, commit summary | `projects` row + a `search_docs` document |
 | File touches | one chokidar watcher per registered project, debounced + rate limited | `events` (type `file`) |
 | Git history | `git log --all --numstat` on register; `post-commit` hook afterwards | `commits` |
@@ -84,6 +85,7 @@ merge-sort into one honest timeline.
 - `brain ui [--port n] [--no-open]` — local web UI: folder browser, one-click register, briefs, timeline, recall
 - `brain init [--no-shell] [--shell s]` — create home, database, config, shell hooks
 - `brain register [path] [--name] [--limit n] [--no-hook]` — register + scan + backfill + watch
+- `brain register <git-url> [--name] [--limit n]` — recall-only source: shallow-clones the repo into `~/.secondbrain/remotes/` and indexes its history, README and layout for recall. No live capture (commands, errors, file touches need a working folder) — the register output says so explicitly
 - `brain projects [--json]` — list with the stored summary, stack, remote and capture stats
 - `brain refresh [project]` — re-scan folder(s) and rebuild the stored overview documents
 - `brain unregister <project> [--keep-hook]` — stop tracking and delete captured data
@@ -139,6 +141,18 @@ merge-sort into one honest timeline.
 - `brain emit --cmd "<command>"` — push an event in from another tool
 - `brain ingest-chat [--adapter id] [--list] [--days n]` — pull AI chat history
 
+**Dogfooding & hygiene**
+- `brain errors [-p project] [--open] [--json]` — failed commands with the captured error output, each
+  paired with the later re-run of the same command that fixed it (or flagged as still open)
+- `brain run "<command>"` — run a command with its output captured, so a failure lands in the record and
+  `brain ask "how did I fix this error before"` becomes a real lookup
+- `brain contradictions [-p project] [--cached] [--dismiss id] [--json]` — decisions that conflict with
+  each other (*"SQLite here, Postgres there"*), detected deterministically and refreshed in the background
+- `brain self on|off|status` — dogfooding: log this tool's own commands into its own record
+- `brain self --prune [--all]` — delete that bookkeeping again. By default it removes only the
+  invocations that exited non-zero (failure reports already ignore those); `--all --yes` also removes the
+  successful ones, which are the dogfooding trail `brain self status` shows
+
 **Maintenance**
 - `brain reindex [--provider auto|ollama|hash]` — rebuild embeddings after changing models
 - `brain config [--set key=value] [--path] [--reset]` — inspect or edit config
@@ -164,6 +178,36 @@ The hook ignores its own bookkeeping, records the exit status of the command tha
 directory change calls `brain brief --auto`, which is a silent no-op unless the new directory is a
 registered project that is due a brief (throttled by `brief.minIntervalMinutes`).
 
+### One daemon per brain home
+
+`daemon.json` is a single file, so a second daemon used to bind the next free port and overwrite it —
+leaving the first one watching the same folders, unreachable by `brain daemon stop`, which only knew
+the newest pid. A singleton guard closes that from both ends:
+
+- **The record is claimed exclusively** (created with `O_EXCL`). A second daemon cannot publish
+  itself over a live one: it finds a live holder and exits instead of serving alongside it. A record
+  is only trusted when the port answers *as the pid the record names* — after a crash that port is
+  free again, so a bare ping would come back from the restarter itself and a dead record would look
+  alive, and a reused pid would make the stale record refuse forever.
+- **The record decides what "usable" means.** The record's token is what the hook authenticates
+  with, so a daemon serving this home that the record does *not* describe cannot be adopted —
+  capture would stay broken while it ran. `brain daemon start` stops it and starts a real one
+  instead, and says so. A daemon built before the guard answers the ping without naming a home; when
+  the record names it, the record is proof enough that it is this home's.
+- **Starting adopts instead of duplicating.** `brain daemon start` sweeps the daemon port range with
+  the unauthenticated ping *before* spawning, so it finds and reports a daemon that is already
+  serving this home — including one running without a record, which a single record lookup never
+  could. Anything left over after a start is stopped, since the new daemon now owns the record.
+- **Stopping covers the whole home.** `brain daemon stop` stops the daemon the record describes plus
+  every other daemon that reports this home, not just the recorded pid. `--force` also takes the ones
+  that cannot say which home they serve (a leftover from an older version); they are only killed on
+  request, because stopping another home's capture would be worse than leaving a stray process
+  behind. `brain daemon status` names them with the exact command, so a pre-guard stray stays
+  findable until you decide.
+
+`brain daemon status` names any extras so the process list stays explicable, and the UI's Start/Stop
+buttons call the same guard — clicking Start twice can no longer orphan a daemon.
+
 ### PowerShell
 
 Windows users type into PowerShell, so `brain init` / `brain shell install` detect the invoking shell
@@ -186,10 +230,12 @@ socket line as the POSIX hook, and never raises an error into your prompt.
 opens it in your browser. It exists so you never have to remember the order of `init` → `cd` →
 `register` again:
 
-- **Track a folder** — type a path or click through a built-in folder browser (drives on Windows,
-  git repos and already-tracked folders tagged). Registering runs the exact same flow as
-  `brain register` and reports what it stored: summary, stack, languages, layout, entry points,
-  commits scanned/indexed, hook, watching state.
+- **Track a folder or git link** — type a path or click through a built-in folder browser (drives on
+  Windows, git repos and already-tracked folders tagged). Paste a git link instead and the dialog
+  switches modes on its own: the folder picker hides, the button reads *Register git link*, and the
+  repo is cloned into `~/.secondbrain/remotes/` as a recall-only source — the same flow as
+  `brain register` and it reports what it stored: summary, stack, languages, layout, entry points,
+  commits scanned/indexed, hook, watching state, and whether capture is live or recall-only.
 - **Capture health banner** — the same checks as `brain status`/`doctor`, phrased as something
   actionable ("your powershell shell has no hook — commands typed there are not captured").
 - **Projects** — every project with its stored summary, stack, counts and watch state.
@@ -244,6 +290,17 @@ says so rather than letting a model improvise:
   confidence floor; a distant nearest passage is not enough to ground an answer, so the question is
   refused instead of letting the model design a system that is not there.
 
+**Recency questions read the commits.** *"What was the last thing I completed?"* is answered from the
+stored commits directly (read-only — nothing touches the repository or GitHub): the newest commit whose
+message actually says something is quoted with its files and diff size, the vague tip is named honestly
+instead of being dressed up as work, and a model that shrugs that it "does not remember" is rejected when
+the commits are sitting right there in its context.
+
+**Failed commands are their own class.** When a failure is captured with its output, it is stored as an
+`error` event whose indexed text includes the message the terminal printed — so
+`brain ask "how did I fix this error before"` matches the error text itself, and `brain errors` shows each
+failure next to the later re-run of the same command that succeeded.
+
 ## Configuration
 
 `~/.secondbrain/config.json` (defaults shown; nested values merge over these):
@@ -265,6 +322,8 @@ says so rather than letting a model improvise:
     "ollamaUrl": "http://127.0.0.1:11434",
     "timeoutMs": 20000
   },
+  "selfLog": { "enabled": false },        // dogfooding: record this tool's own commands (brain self on)
+  "contradictions": { "enabled": true, "intervalMinutes": 30 },   // background decision-drift scan
   "watch": {
     "enabled": true,
     "debounceMs": 400,
@@ -287,7 +346,7 @@ Edit with `brain config --set brief.minIntervalMinutes=5` or `brain config --pat
 
 ```bash
 npm run typecheck     # tsc --noEmit over src
-npm test              # build, then node:test suite (59 tests)
+npm test              # build, then node:test suite (133 tests)
 npm run test:fast     # suite only, against the existing build
 ```
 
@@ -296,7 +355,11 @@ and real-repo backfill, hook install/chain/uninstall, ingestion filters, FTS-que
 recall ranking, timeline merging, brief generation, the bash/zsh **and PowerShell** snippet
 contracts, project-profile extraction and metadata round trips, recall of the project overview
 document, the watcher's ignore rules (with a real chokidar run), each chat adapter against fixtures,
-and a `vm.Script` compile check of the emitted UI page so a broken template escape cannot ship.
+the contradiction detector (conflicting accepted decisions, and the rejected-option non-case), error
+capture with its paired fix, and self-logging; the daemon guard (exclusive claim, refusing a second
+daemon, crash recovery from a stale or reused-pid record, finding a daemon with no record, adopting
+versus replacing, and asking a daemon to stop before killing it); and a `vm.Script` compile check of
+the emitted UI page so a broken template escape cannot ship.
 
 ## Limits and known trade-offs
 

@@ -1,12 +1,14 @@
 import type { BrainConfig } from '../config.js';
 import type { Db } from '../db/index.js';
 import { countChatTurns } from './chat.js';
-import { countCommits } from './commits.js';
+import { countCommits, parseCommitFiles, recentCommits } from './commits.js';
 import { countDecisions } from './decisions.js';
+import { EXCLUDE_SELF } from './errors.js';
 import { countEvents } from './events.js';
 import { listProjects } from './projects.js';
 import { buildTimeline } from './timeline.js';
-import type { OwnerType, ProjectRow, SearchHit, TimelineEntry } from './types.js';
+import type { CommitRow, OwnerType, ProjectRow, SearchHit, TimelineEntry } from './types.js';
+import { commitSubject, isVagueSubject } from '../summarize/brief.js';
 import { hasOllamaModel, listOllamaModels, resolveOllamaModel } from '../embeddings/embedder.js';
 import { createOllamaLlm } from '../llm/ollama.js';
 import { buildProjectProfile, type ProjectProfile } from '../summarize/profile.js';
@@ -77,6 +79,14 @@ const NEGATIVE_PREMISE =
  */
 const ARCHITECTURE_QUESTION =
   /\b(?:architect\w*|design(?:ed|s)?|structured|structure|wired|modular|organi[sz]ed|data ?flow|control flow|pipeline|la(?:id|y) out)\b|\bhow (?:is|are|does|do)\b[^?.!]{0,60}?\b(?:work(?:s)?|built|structured|organi[sz]ed|wired|put together|designed|architected)\b/i;
+
+/**
+ * "What was the last thing I completed?" is a recency question about the
+ * record, not a question about the world. It is answered by reading the newest
+ * commits directly (read-only) instead of leaving a model to remember for you.
+ */
+const COMPLETED_QUESTION =
+  /\bwhat\s+(?:was|were|is)\s+the\s+(?:last|latest|most recent|newest)\s+thing\b|\bwhat\s+(?:did|have)\s+(?:i|we)\s+(?:just\s+|last\s+|recently\s+)?(?:do|done|complete|completed|finish|finished|work on|working on|ship|shipped)\b|\b(?:last|latest|most recent|newest)\s+(?:thing|commit|work|change|task|feature)\s+(?:i|we)\b|\bwhere\s+(?:did|do)\s+(?:i|we)\s+leave\s+off\b/i;
 
 /**
  * Retrieval fuses lexical and vector ranks, so one strong channel scores about
@@ -236,6 +246,69 @@ function standingParagraph(newest: TimelineEntry | undefined, counts: string): s
   );
 }
 
+/** The files of a commit, biggest diff first, as an inline list. */
+function commitFilesLine(row: CommitRow, max = 3): string {
+  const files = [...parseCommitFiles(row.files)]
+    .sort((a, b) => b.add + b.del - (a.add + a.del))
+    .slice(0, max)
+    .map((file) => file.path);
+  return listOf(files, max);
+}
+
+/**
+ * "What was the last thing I completed?" answered from the commits themselves.
+ *
+ * The newest commit is frequently a vague one-liner ("idk anymore"), so the
+ * paragraph leads with the newest commit whose message actually says something,
+ * quotes it with its files and diff size, and then names the vague tip rather
+ * than dressing it up as work. Nothing here writes to git; the commits are read
+ * from the local record the capture pipeline already made.
+ */
+function completedParagraph(commits: CommitRow[], project: ProjectRow | null): string {
+  const scope = project ? ` in ${project.name}` : '';
+  if (commits.length === 0) {
+    return sentence(`Nothing is committed${scope} yet, so there is no finished work to point at`);
+  }
+  const newest = commits[0] as CommitRow;
+  const informative = commits.find((row) => !isVagueSubject(commitSubject(row))) ?? newest;
+  const subject = commitSubject(informative) || '(no message)';
+  const files = commitFilesLine(informative);
+  const diff = informative.insertions + informative.deletions;
+  const bits: string[] = [
+    `The last thing you completed${scope} was ${relativeTime(informative.ts)} — "${truncate(subject, 120)}", ` +
+      `${plural(informative.files_changed, 'file')}${
+        diff > 0 ? ` (+${informative.insertions}/-${informative.deletions})` : ''
+      }${files ? ` across ${files}` : ''}`,
+  ];
+  const earlier = commits.find((row) => row.hash !== informative.hash);
+  if (earlier) {
+    bits.push(
+      `before that, ${relativeTime(earlier.ts)} — "${truncate(commitSubject(earlier) || '(no message)', 110)}"`,
+    );
+  }
+  let paragraph = sentence(bits.join('; '));
+  if (informative.hash !== newest.hash) {
+    paragraph += ` ${sentence(
+      `the newest commit on record (${relativeTime(newest.ts)}) is just "${truncate(
+        commitSubject(newest) || '(no message)',
+        50,
+      )}", which says little about what actually changed`,
+    )}`;
+  }
+  return paragraph;
+}
+
+/**
+ * A model answer that shrugs ("you don't remember the details of that commit")
+ * is worse than the composed one whenever the commits are sitting right there in
+ * the context, so it is rejected the same way narating the machinery is.
+ */
+function dodgesRecord(text: string): boolean {
+  return /\b(?:i|you)\s+(?:do not|don'?t|doesn'?t|does not)\s+(?:remember|recall)\b|\bno (?:memory|record|details) of\b/i.test(
+    text,
+  );
+}
+
 /** The closest thing on record, said plainly rather than listed. */
 function evidenceParagraph(evidence: SearchHit[], query: string): string {
   const top = evidence[0];
@@ -268,8 +341,10 @@ async function safeProfile(db: Db, project: ProjectRow): Promise<ProjectProfile 
 export function hasFailureEvidence(db: Db, projectId: number | null): boolean {
   const projectFilter = projectId === null ? '' : 'AND project_id = ?';
   const params: unknown[] = projectId === null ? [] : [projectId];
+  // The tool's own bookkeeping invocations (`source = 'self'`) are not evidence
+  // about the user's project — see core/errors.ts.
   const failed = db
-    .prepare(`SELECT COUNT(*) AS n FROM events WHERE exit_code != 0 ${projectFilter}`)
+    .prepare(`SELECT COUNT(*) AS n FROM events WHERE exit_code != 0 ${EXCLUDE_SELF} ${projectFilter}`)
     .get(...params) as { n: number };
   if (failed.n > 0) return true;
   const reverts = db
@@ -318,7 +393,8 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
   // Retrieval decides how much licence the answer has: a question that neither
   // names the workspace nor matched anything is out of scope, and is refused
   // rather than answered from whatever happened to rank highest.
-  const onTopic = referencesProject(query, project) || !input.weak;
+  const completedQuestion = COMPLETED_QUESTION.test(query);
+  const onTopic = completedQuestion || referencesProject(query, project) || !input.weak;
   const about = ABOUT_PROJECT.test(query) && onTopic;
 
   const sources: AnswerSource[] = input.hits.slice(0, 6).map((hit) => ({
@@ -360,6 +436,10 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
   // with — otherwise every answer would cite itself.
   const evidence = input.hits.filter((hit) => !(hit.ownerType === 'project' && overview !== null)).slice(0, 4);
 
+  // Read the newest commits out of the local record (never by touching the
+  // repository) so a "what did I last complete" question can quote one.
+  const lastCommits = recentCommits(db, project ? project.id : null, 5);
+
   const newest = buildTimeline(db, { projectId: project ? project.id : null, limit: 1 })[0];
   // countCommits is per-project, so an unscoped answer sums across workspaces.
   const commitCount = project
@@ -374,19 +454,42 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
 
   const profile = project && (overview === null || about) ? await safeProfile(db, project) : null;
 
+  // The deterministic state line, and the phrase used to tell whether a model
+  // answer already stated it. For a recency question the anchor is the newest
+  // commit rather than the vaguest newest timeline entry.
+  const stateLine = completedQuestion
+    ? sentence(`On record there are ${counts}`)
+    : standingParagraph(newest, counts);
+  const recencyAnchor =
+    completedQuestion && lastCommits[0]
+      ? commitSubject(lastCommits[0])
+      : newest
+        ? humanizeTimeline(newest)
+        : '';
+
   const paragraphs: string[] = [];
   const identity = identityParagraph(project, overview, profile);
   const structure = structureParagraph(profile);
   if (onTopic) {
-    if (identity) paragraphs.push(identity);
-    if (structure) paragraphs.push(structure);
-    if (!about && evidence.length > 0) paragraphs.push(evidenceParagraph(evidence, query));
+    if (completedQuestion) {
+      // The recency paragraph *is* the answer here: a description of the
+      // workspace or a tour of its folders would bury it.
+      if (identity && overview === null) paragraphs.push(identity);
+      paragraphs.push(completedParagraph(lastCommits, project));
+    } else {
+      if (identity) paragraphs.push(identity);
+      if (structure) paragraphs.push(structure);
+      if (!about && evidence.length > 0) paragraphs.push(evidenceParagraph(evidence, query));
+    }
   } else {
     paragraphs.push(
       sentence(`Nothing in the recorded history of this workspace covers "${truncate(query, 70)}"`),
     );
   }
-  paragraphs.push(standingParagraph(newest, counts));
+  // The commit paragraph already states when the work happened, so for a
+  // recency question this line reports the totals without repeating a vaguer
+  // "newest activity was …" version of the same fact.
+  paragraphs.push(stateLine);
 
   const llm: GroundedAnswer['llm'] = { used: false, model: config.llm.model };
   let generator: GroundedAnswer['generator'] = overview && about ? 'stored-overview' : 'captured-history';
@@ -414,6 +517,14 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
         overview ? `Stored overview: ${overview}` : '',
         structure ? `Codebase: ${structure}` : '',
         newest ? `Most recent activity (${relativeTime(newest.ts)}): ${humanizeTimeline(newest)}` : '',
+        lastCommits.length > 0 ? 'Recent commits (newest first):' : '',
+        ...lastCommits.map(
+          (row) =>
+            `- (${relativeTime(row.ts)}) "${commitSubject(row) || '(no message)'}" — ${plural(
+              row.files_changed,
+              'file',
+            )}, +${row.insertions}/-${row.deletions}${commitFilesLine(row) ? `: ${commitFilesLine(row)}` : ''}`,
+        ),
         `On record: ${counts}`,
         ...evidence.map((hit) => `${KIND_LABELS[hit.ownerType]} (${relativeTime(hit.ts)}): ${humanize(hit.ownerType, hit.text)}`),
       ]
@@ -425,8 +536,20 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
       const retrievalNote = input.weak
         ? '\nRetrieval note: search confidence for this question is low and the passages below are only loosely related. If the question is not about this project or its recorded history, say plainly that you have nothing recorded on it.'
         : '';
+      // A small model will happily infer a project's purpose from its commit
+      // messages ("appears to be a task tracker") even when the stored overview
+      // says exactly what the project is. When the question is about the
+      // workspace and that overview exists, hand the model the identity as a
+      // fact instead of letting it guess from history.
+      // Not for a recency question ("what did I last complete?"): those also read
+      // as "about" the workspace, and they need the commit instruction instead.
+      const identity =
+        about && overview && !completedQuestion
+          ? `\n\nIdentity (authoritative, from the stored overview of ${project ? project.name : 'this workspace'}): ${overview}` +
+            '\nAnswer from that overview. Do not infer what this project is from its commit messages or file names.'
+          : '';
       const generated = await client.generate(
-        `${subject}${retrievalNote}\n\nContext:\n${context}\n\nQuestion: ${query}\n\nAnswer:`,
+        `${subject}${retrievalNote}\n\nContext:\n${context}\n\nQuestion: ${query}${identity}\n\nAnswer:`,
         {
           system:
             'You are the recall layer of a local second brain, answering questions about the user\'s own software project. ' +
@@ -435,6 +558,8 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
             'Ground every fact in the context, but you may explain what the context implies, connect the dots, and reason a step or two beyond it when the question calls for judgement. ' +
             'If the question assumes something the context does not support, say so plainly instead of playing along. ' +
             'If the question is unrelated to this project, or is not intelligible, say you have nothing recorded on it — do not invent a connection. ' +
+            'The commits in the context are real history: when asked what you last did or completed, name that commit\'s subject and the files it changed, and never claim you cannot recall details that the context contains. ' +
+            'When a commit message is a vague one-liner, say the message itself is unhelpful and describe the files it touched instead. ' +
             'Never invent files, dates, technologies, people or numbers that are not in the context.',
           temperature: 0.35,
           maxTokens: 450,
@@ -442,22 +567,24 @@ export async function answerQuestion(db: Db, config: BrainConfig, input: AnswerI
       );
       const written = trimToAnswer(generated);
       // A small model sometimes answers with nothing but a restatement of the
-      // question. When that happens the composed answer is strictly better, so
-      // keep it instead of shipping the empty shell.
-      if (written.length >= 50 && !isMetaNarration(written)) {
+      // question, or shrugs that it does not remember work that is right there
+      // in the context. When that happens the composed answer is strictly
+      // better, so keep it instead of shipping the empty shell.
+      const shrugged = completedQuestion && lastCommits.length > 0 && dodgesRecord(written);
+      if (written.length >= 50 && !isMetaNarration(written) && !shrugged) {
         // The model writes the answer; the evidence stays as the footnotes. The
         // deterministic state line is only kept when the model did not already
         // say the same thing, so answers do not end in an echo.
         const alreadySaid =
-          newest !== undefined &&
-          written.toLowerCase().includes(humanizeTimeline(newest).toLowerCase().slice(0, 24));
+          recencyAnchor.length > 0 && written.toLowerCase().includes(recencyAnchor.toLowerCase().slice(0, 24));
         paragraphs.splice(0, paragraphs.length, written);
-        if (!alreadySaid) paragraphs.push(standingParagraph(newest, counts));
+        if (!alreadySaid) paragraphs.push(stateLine);
         generator = 'local-model';
         llm.used = true;
       } else {
-        llm.reason =
-          generated.trim().length > 0
+        llm.reason = shrugged
+          ? 'the model claimed not to remember commits that are on record, so the composed answer was kept'
+          : generated.trim().length > 0
             ? 'the model only restated the question, so the composed answer was kept'
             : 'the model returned an empty response';
       }

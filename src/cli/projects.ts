@@ -7,9 +7,10 @@ import { countCommits } from '../core/commits.js';
 import { countDecisions } from '../core/decisions.js';
 import { countEvents } from '../core/events.js';
 import { listProjects, removeProject, findProjectByPath } from '../core/projects.js';
-import { makeIndexer, onboardProject } from '../capture/ingest.js';
+import { makeIndexer, onboardProject, connectProjectFolder } from '../capture/ingest.js';
 import { pingDaemon, readDaemonRecord, request, watchedProjectIds } from '../capture/client.js';
 import { hasPostCommitHook, uninstallPostCommitHook } from '../git/git.js';
+import { looksLikeGitUrl } from '../git/remote.js';
 import { configPath, dbPath, brainHome, normalizePath } from '../util/paths.js';
 import { plural, relativeTime, shortPath, truncate } from '../util/format.js';
 import {
@@ -114,8 +115,11 @@ export function registerProjectCommands(program: Command): void {
     .description('Register a project: scan it, backfill git history and start capturing')
     .action(
       action(async (target: string, options: { name?: string; limit?: number; hook: boolean; json?: boolean }) => {
-        const projectPath = normalizePath(target);
-        if (!fs.existsSync(projectPath)) throw new Error(`path does not exist: ${projectPath}`);
+        // Git URLs skip the local-path checks entirely — they are cloned by
+        // onboardProject into the brain home as recall-only sources.
+        const isRemote = looksLikeGitUrl(target.trim());
+        const projectPath = isRemote ? target.trim() : normalizePath(target);
+        if (!isRemote && !fs.existsSync(projectPath)) throw new Error(`path does not exist: ${projectPath}`);
         const { db, config, close } = createContext();
         try {
           const embedder = await getEmbedder(config);
@@ -206,6 +210,45 @@ export function registerProjectCommands(program: Command): void {
               }`,
             );
           }
+        } finally {
+          close();
+        }
+      }),
+    );
+
+  program
+    .command('connect')
+    .argument('<project>', 'existing recall-only project (name, id or path)')
+    .argument('<folder>', 'local working folder of the same repository')
+    .description('Connect a local folder to a git-URL project: same record, now with capture')
+    .option('--json', 'machine-readable output')
+    .action(
+      action(async (target: string, folder: string, options: { json?: boolean }) => {
+        const { db, config, close } = createContext();
+        try {
+          const project =
+            findProjectByPath(db, target) ??
+            (listProjects(db).find((p) => p.name === target || String(p.id) === target) ?? null);
+          if (!project) throw new Error(`no project matching "${target}"`);
+          const embedder = await getEmbedder(config);
+          const index = makeIndexer(db, embedder);
+          const result = await connectProjectFolder(db, index, project.id, folder, { config });
+          if (options.json) {
+            printJson({
+              id: result.project.id,
+              name: result.project.name,
+              path: result.project.path,
+              commitsInserted: result.commitsInserted,
+              commitsIndexed: result.commitsIndexed,
+              watched: result.watched,
+              warnings: result.warnings,
+            });
+            return;
+          }
+          ok(`connected ${c.bold(result.project.name)} to ${shortPath(result.project.path, 70)}`);
+          keyValue('commits', `${result.commitsInserted} new from the folder, ${result.commitsIndexed} indexed`);
+          keyValue('capture', result.watched ? 'watching — commands and errors now recorded' : c.yellow('daemon not watching — run brain daemon start'));
+          for (const warning of result.warnings) out(`  ${c.yellow('warn')} ${warning}`);
         } finally {
           close();
         }

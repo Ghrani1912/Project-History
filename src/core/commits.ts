@@ -116,6 +116,20 @@ export function listCommits(db: Db, projectId: number, limit = 50): CommitRow[] 
     .all(projectId, limit) as CommitRow[];
 }
 
+/**
+ * Newest commits across one project, or across every project when `projectId`
+ * is null. Used for "what did I last complete" so the answer can quote the
+ * commit itself rather than describing the idea of one.
+ */
+export function recentCommits(db: Db, projectId: number | null, limit = 5): CommitRow[] {
+  if (projectId === null) {
+    return db
+      .prepare('SELECT * FROM commits ORDER BY ts DESC LIMIT ?')
+      .all(limit) as CommitRow[];
+  }
+  return listCommits(db, projectId, limit);
+}
+
 export function firstCommitTs(db: Db, projectId: number): number | null {
   const row = db.prepare('SELECT MIN(ts) AS ts FROM commits WHERE project_id = ?').get(projectId) as {
     ts: number | null;

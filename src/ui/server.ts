@@ -8,9 +8,9 @@ import type { BrainConfig } from '../config.js';
 import { countBriefs } from '../core/briefs.js';
 import { countChatTurns } from '../core/chat.js';
 import { countCommits } from '../core/commits.js';
-import { countDecisions } from '../core/decisions.js';
+import { countDecisions, parseDecisionText } from '../core/decisions.js';
 import { countEvents } from '../core/events.js';
-import { indexProjectCommits, makeIndexer, onboardProject } from '../capture/ingest.js';
+import { indexProjectCommits, makeIndexer, onboardProject, recordDecision } from '../capture/ingest.js';
 import { listProjects, getProject, removeProject, resolveProjectForPath } from '../core/projects.js';
 import { ask } from '../core/recall.js';
 import { buildTimeline } from '../core/timeline.js';
@@ -30,6 +30,16 @@ import {
 } from '../core/priorart.js';
 import { checkProposal, explainFinding } from '../core/preflight.js';
 import { answerQuestion } from '../core/answer.js';
+import {
+  countContradictions,
+  detectContradictions,
+  dismissContradiction,
+  listContradictions,
+  persistContradictions,
+} from '../core/contradictions.js';
+import { countOpenFailures, EXCLUDE_SELF, listFailures } from '../core/errors.js';
+import { connectProjectFolder } from '../capture/ingest.js';
+import { isRecallOnly, looksLikeGitUrl } from '../git/remote.js';
 
 /** Deep link to a commit when the project has a hosting remote we understand. */
 export function commitUrl(remote: string | null, hash: string): string | null {
@@ -50,6 +60,7 @@ import {
   startDaemonDetached,
   watchedProjectIds,
 } from '../capture/client.js';
+import { daemonSituation, stopDaemonsForHome } from '../capture/daemonGuard.js';
 import { countEmbeddings } from '../embeddings/store.js';
 import { createEmbedder, hasOllamaModel, listOllamaModels, type Embedder } from '../embeddings/embedder.js';
 import { hasPostCommitHook, gitRemote, isGitRepo, uninstallPostCommitHook } from '../git/git.js';
@@ -241,6 +252,18 @@ export class BrainUiServer {
       case 'GET /api/ask':
         this.sendJson(res, 200, await this.ask(url));
         return;
+      case 'GET /api/hygiene':
+        this.sendJson(res, 200, await this.hygiene());
+        return;
+      case 'POST /api/hygiene/dismiss':
+        this.sendJson(res, 200, await this.dismissContradiction(await this.readBody(req)));
+        return;
+      case 'POST /api/decision':
+        this.sendJson(res, 200, await this.logDecision(await this.readBody(req)));
+        return;
+      case 'POST /api/connect':
+        this.sendJson(res, 200, await this.connect(await this.readBody(req)));
+        return;
       case 'POST /api/register':
         this.sendJson(res, 200, await this.register(await this.readBody(req)));
         return;
@@ -295,6 +318,22 @@ export class BrainUiServer {
       );
     }
 
+    // Capture fidelity: a failed command saved without its output is half a
+    // record — the error text is exactly what "how did I fix X" needs to match.
+    const bareFailures = (
+      this.db
+        .prepare(`SELECT COUNT(*) AS n FROM events WHERE type = 'cmd' AND exit_code != 0 ${EXCLUDE_SELF}`)
+        .get() as { n: number }
+    ).n;
+    const errorsWithOutput = (
+      this.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'error'").get() as { n: number }
+    ).n;
+    if (bareFailures > 0 && errorsWithOutput === 0) {
+      warnings.push(
+        `Failed commands from your shell are saved without their output (${bareFailures} so far), so "how did I fix X" cannot match the error text. Wrap important runs: brain run "<cmd>".`,
+      );
+    }
+
     return {
       home: brainHome(),
       database: dbPath(),
@@ -309,6 +348,10 @@ export class BrainUiServer {
       shells: { invoking, hooks, expected: shells },
       llm: { provider: this.options.config.llm.provider, model: this.options.config.llm.model, ready: llmReady },
       embedder: embedder.model,
+      hygiene: {
+        contradictions: countContradictions(this.db),
+        openFailures: countOpenFailures(this.db),
+      },
       totals: {
         projects: projects.length,
         events: countEvents(this.db),
@@ -340,6 +383,29 @@ export class BrainUiServer {
       watched: watched.includes(project.id),
       hook: fs.existsSync(path.join(project.path, '.git')) ? hasPostCommitHook(project.path) : false,
       exists: fs.existsSync(project.path),
+      recallOnly: isRecallOnly(project),
+    };
+  }
+
+  /**
+   * Give a recall-only (git-URL) project its working folder: same project row,
+   * same history, now capturing. The clone stays in the cache as backup.
+   */
+  private async connect(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const id = Number(body.project);
+    const folder = String(body.folder ?? '').trim();
+    if (!Number.isFinite(id)) throw new Error('a project id is required');
+    if (folder.length === 0) throw new Error('pick the local folder of this repository first');
+    const embedder = await this.embedderOrDefault();
+    const index = makeIndexer(this.db, embedder);
+    const result = await connectProjectFolder(this.db, index, id, folder, { config: this.options.config });
+    return {
+      connected: result.project.name,
+      path: result.project.path,
+      commitsInserted: result.commitsInserted,
+      commitsIndexed: result.commitsIndexed,
+      watched: result.watched,
+      warnings: result.warnings,
     };
   }
 
@@ -397,10 +463,17 @@ export class BrainUiServer {
 
   private async register(body: Record<string, unknown>): Promise<Record<string, unknown>> {
     const raw = String(body.path ?? '').trim();
-    if (raw.length === 0) throw new Error('a folder path is required');
-    const target = normalizePath(raw);
-    if (!fs.existsSync(target)) throw new Error(`path does not exist: ${target}`);
-    if (!fs.statSync(target).isDirectory()) throw new Error(`not a folder: ${target}`);
+    if (raw.length === 0) throw new Error('a folder or git URL is required');
+    // A git URL is cloned into the brain home by onboardProject and registered
+    // recall-only, so the local-path checks below must not run for it — and it
+    // must reach onboardProject un-normalized (normalizePath would resolve the
+    // URL against the working directory).
+    const remote = looksLikeGitUrl(raw);
+    const target = remote ? raw : normalizePath(raw);
+    if (!remote) {
+      if (!fs.existsSync(target)) throw new Error(`path does not exist: ${target}`);
+      if (!fs.statSync(target).isDirectory()) throw new Error(`not a folder: ${target}`);
+    }
 
     const name = typeof body.name === 'string' && body.name.trim().length > 0 ? body.name.trim() : undefined;
     const limit = typeof body.limit === 'number' && body.limit > 0 ? body.limit : undefined;
@@ -420,6 +493,7 @@ export class BrainUiServer {
         stack: result.profile.stack.join(', '),
       },
       created: result.created,
+      recallOnly: isRecallOnly(result.project),
       profile: {
         summary: result.profile.summary,
         stack: result.profile.stack,
@@ -481,30 +555,132 @@ export class BrainUiServer {
     return { removed: project.name };
   }
 
+  /**
+   * Start and stop go through the singleton guard, exactly as the CLI does —
+   * otherwise clicking Start twice in the UI would be a second way to orphan a
+   * daemon, and Stop would leave its siblings watching the same folders.
+   */
   private async daemon(body: Record<string, unknown>): Promise<Record<string, unknown>> {
     const action = String(body.action ?? '');
     if (action === 'start') {
+      // Adopt whatever already serves this home before spawning anything: the
+      // sweep also sees a daemon running without a usable record, which a single
+      // record lookup never could.
+      const situation = await daemonSituation(this.options.config);
+      const unattributed = situation.unattributed.map((entry) => entry.pid);
+      if (situation.recorded) {
+        const active = situation.recorded;
+        await request('syncWatch', undefined, { record: readDaemonRecord() ?? undefined }).catch(() => null);
+        return {
+          started: true,
+          adopted: true,
+          port: active.port,
+          pid: active.pid,
+          extras: situation.unreachable.map((entry) => entry.pid),
+          unattributed,
+        };
+      }
+      // Serving this home but not in the record: the hooks hold no token for it,
+      // so it cannot be adopted — replace it rather than leave capture broken.
+      if (situation.unreachable.length > 0) {
+        await stopDaemonsForHome(this.options.config);
+      }
       const record = await connect(this.options.config).catch(() => null);
       if (!record) {
         startDaemonDetached();
-        return { started: false, message: 'starting…' };
+        return { started: false, message: 'starting…', replaced: situation.unreachable.map((e) => e.pid), unattributed };
       }
       await request('syncWatch', undefined, { record }).catch(() => null);
-      return { started: true, port: record.port, pid: record.pid };
+      return {
+        started: true,
+        port: record.port,
+        pid: record.pid,
+        replaced: situation.unreachable.map((entry) => entry.pid),
+        unattributed,
+      };
     }
     if (action === 'stop') {
-      const record = readDaemonRecord();
-      if (!record) return { stopped: false };
-      await request('shutdown', undefined, { record, timeoutMs: 3000 }).catch(() => {
-        try {
-          process.kill(record.pid);
-        } catch {
-          // already gone
-        }
-      });
-      return { stopped: true, pid: record.pid };
+      // Every daemon serving this home, not just the one in the record. A stray
+      // from before the guard keeps capturing until it is actually stopped.
+      const report = await stopDaemonsForHome(this.options.config);
+      return {
+        stopped: report.stopped.length > 0,
+        pids: report.stopped,
+        left: report.left.map((entry) => entry.pid),
+        untouched: report.untouched.map((entry) => entry.pid),
+      };
     }
     throw new Error('action must be start or stop');
+  }
+
+  /**
+   * The memory-hygiene panel: contradictions between logged decisions and
+   * failures that were never re-run successfully. Reads live rather than from
+   * a cache — a scan is cheap (pure SQL over a few hundred rows), so the panel
+   * always reflects this moment.
+   */
+  private async hygiene(): Promise<Record<string, unknown>> {
+    const found = detectContradictions(this.db, {});
+    const inserted = persistContradictions(this.db, found);
+    if (inserted > 0) log.info(`hygiene panel scan: ${inserted} new conflict(s)`);
+    return {
+      contradictions: listContradictions(this.db, null, 20).map((row) => ({
+        id: row.id,
+        project: row.projectName,
+        category: row.category,
+        choiceA: row.choiceA,
+        choiceB: row.choiceB,
+        score: row.score,
+        reason: row.reason,
+        detectedAt: row.detectedAt,
+        a: { text: row.a.text, ts: row.a.ts },
+        b: { text: row.b.text, ts: row.b.ts },
+      })),
+      failures: listFailures(this.db, { limit: 20, openOnly: true }).map((failure) => ({
+        id: failure.id,
+        project: failure.projectName,
+        cmd: failure.cmd,
+        exitCode: failure.exitCode,
+        output: failure.output,
+        ts: failure.ts,
+      })),
+    };
+  }
+
+  /**
+   * Record a decision from the panel. Both the memory-hygiene card and the
+   * plan check read decisions, so the UI has to be able to write one —
+   * otherwise a panel with no CLI is telling you to open a terminal.
+   */
+  private async logDecision(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const text = String(body.text ?? '').trim();
+    if (text.length === 0) throw new Error('a decision needs some text');
+    const id = Number(body.project);
+    const project = Number.isFinite(id) && id > 0 ? getProject(this.db, id) : null;
+    if (!project) throw new Error(`no project matching "${String(body.project ?? '')}"`);
+    const embedder = await this.embedderOrDefault();
+    const result = await recordDecision(this.db, makeIndexer(this.db, embedder), {
+      projectId: project.id,
+      text,
+      source: 'ui',
+    });
+    // #tags are extracted by addDecision; parse again only to report them.
+    const parsed = parseDecisionText(text);
+    return {
+      decisionId: result.decisionId,
+      project: project.name,
+      text: parsed.text,
+      tags: parsed.tags,
+      decisions: countDecisions(this.db, project.id),
+    };
+  }
+
+  private async dismissContradiction(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const id = Number(body.id);
+    if (!Number.isFinite(id)) throw new Error('a contradiction id is required');
+    const removed = dismissContradiction(this.db, id);
+    if (!removed) throw new Error(`no contradiction with id ${id}`);
+    return { dismissed: id };
   }
 
   private async installHooks(): Promise<Record<string, unknown>> {

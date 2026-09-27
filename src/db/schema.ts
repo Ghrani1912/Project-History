@@ -5,7 +5,7 @@
  * *content* (git commit time, chat message time, command wall-clock), never from
  * file mtime, so cross-source events merge-sort correctly.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -81,6 +81,22 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_project_ts ON decisions(project_id, ts DESC);
 
+CREATE TABLE IF NOT EXISTS contradictions (
+  id          INTEGER PRIMARY KEY,
+  project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  a_id        INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+  b_id        INTEGER NOT NULL REFERENCES decisions(id) ON DELETE CASCADE,
+  category    TEXT    NOT NULL,
+  choice_a    TEXT    NOT NULL,
+  choice_b    TEXT    NOT NULL,
+  score       REAL    NOT NULL DEFAULT 0,
+  reason      TEXT    NOT NULL,
+  detected_at INTEGER NOT NULL,
+  dismissed   INTEGER NOT NULL DEFAULT 0,
+  UNIQUE(a_id, b_id)
+);
+CREATE INDEX IF NOT EXISTS idx_contradictions_project ON contradictions(project_id, detected_at DESC);
+
 CREATE TABLE IF NOT EXISTS briefs (
   id               INTEGER PRIMARY KEY,
   project_id       INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -143,6 +159,7 @@ END;
 export const DATA_TABLES = [
   'embeddings',
   'search_docs',
+  'contradictions',
   'briefs',
   'decisions',
   'chat_turns',

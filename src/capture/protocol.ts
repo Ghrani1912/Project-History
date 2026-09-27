@@ -8,6 +8,8 @@ export interface CapturePayload {
   cwd: string;
   cmd?: string;
   exitCode?: number | null;
+  /** Captured stdout/stderr tail for a failed command. */
+  output?: string;
   path?: string;
   action?: 'create' | 'change' | 'delete';
   /** Epoch millis parsed from the content itself, when known. */

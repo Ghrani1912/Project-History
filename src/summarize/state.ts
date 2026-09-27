@@ -741,7 +741,12 @@ export function projectScopeNarrative(input: ScopeInput): string[] {
     .map((entry) => `${entry.files} ${entry.language.toLowerCase()}`)
     .join(', ');
   const facts: string[] = [];
-  facts.push(stack ? `a ${stack} project${languages ? ` (${languages} files)` : ''}` : 'a code project');
+  if (stack) {
+    // "unknown stack" starts with a vowel sound; everything else reads with "a".
+    facts.push(stack === 'unknown stack' ? `an ${stack} project` : `a ${stack} project${languages ? ` (${languages} files)` : ''}`);
+  } else {
+    facts.push('a code project');
+  }
   if (dirs.length > 0) facts.push(`laid out as ${dirs.join(', ')}`);
   if (input.gitRemote) facts.push(`tracked at ${input.gitRemote}${input.branch ? ` on \`${input.branch}\`` : ''}`);
   const summary = input.summary && input.summary.length > 8 ? input.summary : null;

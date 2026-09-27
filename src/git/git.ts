@@ -12,19 +12,32 @@ export interface GitResult {
   stderr: string;
 }
 
-export function git(args: string[], cwd: string, maxBuffer = 64 * 1024 * 1024): Promise<GitResult> {
+export function git(
+  args: string[],
+  cwd: string,
+  maxBuffer = 64 * 1024 * 1024,
+  env: Record<string, string> = {},
+): Promise<GitResult> {
   return new Promise((resolve) => {
-    execFile('git', args, { cwd, maxBuffer, windowsHide: true }, (error, stdout, stderr) => {
-      const code = error && typeof (error as { code?: unknown }).code === 'number' ? Number((error as { code: number }).code) : error ? 1 : 0;
-      resolve({ code, stdout: stdout?.toString() ?? '', stderr: stderr?.toString() ?? '' });
-    });
+    execFile(
+      'git',
+      args,
+      { cwd, maxBuffer, windowsHide: true, env: { ...process.env, ...env } },
+      (error, stdout, stderr) => {
+        const code = error && typeof (error as { code?: unknown }).code === 'number' ? Number((error as { code: number }).code) : error ? 1 : 0;
+        resolve({ code, stdout: stdout?.toString() ?? '', stderr: stderr?.toString() ?? '' });
+      },
+    );
   });
 }
 
 export async function isGitRepo(cwd: string): Promise<boolean> {
   if (!fs.existsSync(cwd)) return false;
   const res = await git(['rev-parse', '--is-inside-work-tree'], cwd);
-  return res.code === 0 && res.stdout.trim() === 'true';
+  if (res.code === 0 && res.stdout.trim() === 'true') return true;
+  // Bare clones (our remote-source cache) have no work tree but do have history.
+  const bare = await git(['rev-parse', '--is-bare-repository'], cwd);
+  return bare.code === 0 && bare.stdout.trim() === 'true';
 }
 
 export async function gitToplevel(cwd: string): Promise<string | null> {

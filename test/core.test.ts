@@ -32,11 +32,21 @@ test('schema is created and migrations are idempotent', () => {
     .prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
     .all() as Array<{ name: string }>;
   const names = tables.map((t) => t.name);
-  for (const expected of ['projects', 'events', 'commits', 'chat_turns', 'decisions', 'briefs', 'embeddings', 'search_fts']) {
+  for (const expected of [
+    'projects',
+    'events',
+    'commits',
+    'chat_turns',
+    'decisions',
+    'contradictions',
+    'briefs',
+    'embeddings',
+    'search_fts',
+  ]) {
     assert.ok(names.includes(expected), `missing table ${expected}`);
   }
   const version = db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as { value: string };
-  assert.equal(version.value, '1');
+  assert.equal(version.value, '2');
   db.close();
 
   // Re-opening must not throw or duplicate tables.

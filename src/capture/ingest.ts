@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import type { BrainConfig } from '../config.js';
 import type { Db } from '../db/index.js';
 import type { Embedder } from '../embeddings/embedder.js';
@@ -9,6 +10,7 @@ import { indexBatch, type IndexInput } from '../core/indexing.js';
 import { registerProject, resolveProjectForPath, setProjectMeta, touchProject } from '../core/projects.js';
 import type { ProjectRow } from '../core/types.js';
 import { backfillHistory, installPostCommitHook, type HookResult } from '../git/git.js';
+import { ensureRemoteClone, looksLikeGitUrl } from '../git/remote.js';
 import { buildProjectProfile, type ProjectProfile } from '../summarize/profile.js';
 import { normalizePath } from '../util/paths.js';
 import { truncate } from '../util/format.js';
@@ -73,6 +75,12 @@ export interface CommandInput {
   ts?: number;
   source: string;
   sessionId?: string | null;
+  /**
+   * Captured stdout/stderr tail. A failing command that carries output is
+   * stored as an `error` event so failed work becomes its own searchable class
+   * rather than a command line with a non-zero exit code.
+   */
+  output?: string | null;
 }
 
 export interface IngestOutcome {
@@ -86,25 +94,36 @@ export async function recordCommand(db: Db, index: Indexer, input: CommandInput)
   const ts = input.ts ?? Date.now();
   const project = resolveProjectForPath(db, input.cwd);
   const cmd = truncate(input.cmd, 4000);
+  const exitCode = input.exitCode ?? 0;
+  const output = input.output ? truncate(input.output, 4000) : '';
+  // A failure *with* output is a different thing from a command line: it is the
+  // error text itself, which is what you actually search for months later.
+  const failed = exitCode !== 0 && output.length > 0;
   const eventId = insertEvent(db, {
     projectId: project?.id ?? null,
-    type: 'cmd',
-    payload: { cmd, cwd: normalizePath(input.cwd) },
-    exitCode: input.exitCode ?? 0,
+    type: failed ? 'error' : 'cmd',
+    payload: failed ? { cmd, cwd: normalizePath(input.cwd), output } : { cmd, cwd: normalizePath(input.cwd) },
+    exitCode,
     ts,
     source: input.source,
     sessionId: input.sessionId ?? null,
   });
   if (project) touchProject(db, project.id, ts);
-  const noteworthy = isNoteworthyCommand(cmd, input.exitCode);
+  const noteworthy = isNoteworthyCommand(cmd, exitCode);
   if (noteworthy) {
+    // The error output is indexed alongside the command so `brain ask "how did I
+    // fix this error"` matches on the message the terminal printed, not just on
+    // the command name.
+    const text = failed
+      ? `error (exit ${exitCode}): ${cmd}\n${truncate(output, 2000)}`
+      : `command: ${cmd}${exitCode ? ` (exit ${exitCode})` : ''}`;
     await index([
       {
         ownerType: 'event',
         ownerId: eventId,
         projectId: project?.id ?? null,
         ts,
-        text: `command: ${cmd}${input.exitCode ? ` (exit ${input.exitCode})` : ''}`,
+        text,
       },
     ]);
   }
@@ -298,11 +317,37 @@ export async function onboardProject(
   projectPath: string,
   options: OnboardOptions = {},
 ): Promise<OnboardResult> {
+  // A git URL registers a recall-only source: clone it shallowly into the
+  // brain home and treat the clone as the project folder. Capture surfaces
+  // (watcher, hooks, commands) do not apply and are reported as such.
+  // NOTE: this check runs on the raw input — normalizePath would resolve a URL
+  // against the working directory and destroy it.
+  if (looksLikeGitUrl(projectPath.trim())) {
+    const url = projectPath.trim();
+    const clone = await ensureRemoteClone(url, { limit: options.limit });
+    return finishOnboard(db, index, clone.path, {
+      ...options,
+      remoteUrl: url,
+      recallOnly: true,
+      skipHook: true,
+      skipWatch: true,
+    });
+  }
   const normalized = normalizePath(projectPath);
   if (!fs.existsSync(normalized)) throw new Error(`path does not exist: ${normalized}`);
   if (fs.statSync(normalized).isFile()) throw new Error(`expected a folder, got a file: ${normalized}`);
 
-  const { project, created } = registerProject(db, normalized, { name: options.name });
+  return finishOnboard(db, index, normalized, options);
+}
+
+/** The shared tail of every registration path: index history + profile. */
+async function finishOnboard(
+  db: Db,
+  index: Indexer,
+  folder: string,
+  options: OnboardOptions & { remoteUrl?: string; recallOnly?: boolean; skipHook?: boolean; skipWatch?: boolean },
+): Promise<OnboardResult> {
+  const { project, created } = registerProject(db, folder, { name: options.name });
   const backfill = await backfillHistory(db, project, { limit: options.limit });
   const profile = await buildProjectProfile(db, project);
 
@@ -325,15 +370,19 @@ export async function onboardProject(
 
   const warnings: string[] = [];
   let hook: HookResult | null = null;
-  if (options.installHook !== false) {
-    hook = installPostCommitHook(normalized);
+  if (options.recallOnly) {
+    warnings.push(
+      'recall-only source: cloned from git for history and recall — no live capture (commands, errors, file touches need a working folder)',
+    );
+  } else if (options.installHook !== false) {
+    hook = installPostCommitHook(folder);
     if (!hook.installed && hook.reason && hook.reason !== 'not a git repository') {
       warnings.push(`could not install the post-commit hook: ${hook.reason}`);
     }
   }
 
   let watched = false;
-  if (options.config) {
+  if (options.config && !options.skipWatch) {
     const daemon = await connect(options.config).catch(() => null);
     if (daemon) {
       const response = await request('syncWatch', undefined, { record: daemon }).catch(() => null);
@@ -354,6 +403,99 @@ export async function onboardProject(
     profileIndexed: true,
     hook,
     watched,
+    warnings,
+  };
+}
+
+export interface ConnectResult {
+  project: ProjectRow;
+  /** Commit rows gained by merging the working folder's full history in. */
+  commitsInserted: number;
+  commitsIndexed: number;
+  watched: boolean;
+  hook: HookResult | null;
+  warnings: string[];
+}
+
+/**
+ * Point an existing recall-only project at a real working folder: the same row
+ * keeps its id, decisions, briefs and history — it just gains capture. Commits
+ * from the local clone upsert on top of the fetched ones (hash-keyed), so the
+ * timeline merges rather than duplicates.
+ */
+export async function connectProjectFolder(
+  db: Db,
+  index: Indexer,
+  projectId: number,
+  folder: string,
+  options: { config?: BrainConfig } = {},
+): Promise<ConnectResult> {
+  const existing = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as ProjectRow | undefined;
+  if (!existing) throw new Error(`no project with id ${projectId}`);
+  const normalized = normalizePath(folder);
+  if (!fs.existsSync(normalized) || !fs.statSync(normalized).isDirectory()) {
+    throw new Error(`not a folder: ${normalized}`);
+  }
+
+  // If the folder is a checkout of a different repo, refuse: connecting is for
+  // the same code, not for re-pointing the project at unrelated work.
+  const { git: runGit } = await import('../git/git.js');
+  const localRemote = await runGit(['remote', 'get-url', 'origin'], normalized);
+  const wanted = (existing.git_remote ?? '').replace(/\.git$/i, '').replace(/\/$/, '').toLowerCase();
+  const found = localRemote.code === 0 ? localRemote.stdout.trim().replace(/\.git$/i, '').replace(/\/$/, '').toLowerCase() : '';
+  if (wanted && found && wanted !== found) {
+    throw new Error(
+      `that folder points at ${found || 'no remote'} — this project tracks ${wanted}. Use unregister + register instead.`,
+    );
+  }
+  // Every validation passed: the path swap below must succeed. A folder that is
+  // already its own registered project collides with projects.path UNIQUE —
+  // say that plainly instead of leaking the SQLite error.
+  const clash = db
+    .prepare('SELECT id, name FROM projects WHERE path = ? AND id != ?')
+    .get(normalized, projectId) as { id: number; name: string } | undefined;
+  if (clash) {
+    throw new Error(`"${clash.name}" (project #${clash.id}) is already registered at that folder — unregister it first if you want to merge`);
+  }
+
+  setProjectMeta(db, projectId, { name: path.basename(normalized) || existing.name });
+  db.prepare('UPDATE projects SET path = ?, last_seen_at = ? WHERE id = ?').run(normalized, Date.now(), projectId);
+
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as ProjectRow;
+  const backfill = await backfillHistory(db, project, {});
+  const profile = await buildProjectProfile(db, project);
+  setProjectMeta(db, projectId, {
+    stack: profile.stack.length > 0 ? profile.stack.join(', ') : null,
+    summary: profile.summary,
+    git_remote: profile.isGitRepo ? profile.gitRemote : null,
+  });
+  const commitsIndexed = await indexProjectCommits(db, index, projectId);
+  await index([{ ownerType: 'project', ownerId: projectId, projectId, ts: Date.now(), text: profile.doc }]);
+
+  const hook = installPostCommitHook(normalized);
+  const warnings: string[] = [];
+  if (!hook.installed && hook.reason && hook.reason !== 'not a git repository') {
+    warnings.push(`could not install the post-commit hook: ${hook.reason}`);
+  }
+
+  let watched = false;
+  if (options.config) {
+    const daemon = await connect(options.config).catch(() => null);
+    if (daemon) {
+      const response = await request('syncWatch', undefined, { record: daemon }).catch(() => null);
+      watched = response?.ok === true;
+    } else {
+      warnings.push('the capture daemon is not running — start it with `brain daemon start`');
+    }
+  }
+
+  const refreshed = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as ProjectRow;
+  return {
+    project: refreshed,
+    commitsInserted: backfill.inserted,
+    commitsIndexed,
+    watched,
+    hook,
     warnings,
   };
 }

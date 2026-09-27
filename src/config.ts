@@ -29,6 +29,15 @@ export interface BrainConfig {
     /** Hard timeout for a summarization call. */
     timeoutMs: number;
   };
+  /** Log this tool's own invocations (dogfooding: the brain remembers its own use). */
+  selfLog: {
+    enabled: boolean;
+  };
+  /** Background decision-drift scan (two decisions that contradict each other). */
+  contradictions: {
+    enabled: boolean;
+    intervalMinutes: number;
+  };
   watch: {
     enabled: boolean;
     debounceMs: number;
@@ -68,6 +77,8 @@ export const DEFAULT_CONFIG: BrainConfig = {
     ollamaUrl: 'http://127.0.0.1:11434',
     timeoutMs: 20000,
   },
+  selfLog: { enabled: false },
+  contradictions: { enabled: true, intervalMinutes: 30 },
   watch: {
     enabled: true,
     debounceMs: 400,

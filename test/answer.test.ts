@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
-import { answerQuestion } from '../dist/core/answer.js';
+import { answerQuestion, hasFailureEvidence } from '../dist/core/answer.js';
 import { upsertCommit } from '../dist/core/commits.js';
 import { addDecision } from '../dist/core/decisions.js';
 import { insertEvent } from '../dist/core/events.js';
@@ -163,6 +163,30 @@ test('a negative premise is answered once the record contains a failed command',
   db.close();
 });
 
+test("the tool's own failed bookkeeping commands are not failure evidence", async () => {
+  const { db, projectId } = seed();
+  // `brain connect` failing while testing is self-logged (`source = 'self'`);
+  // it says nothing about whether this project has a failure to diagnose.
+  insertEvent(db, {
+    projectId,
+    type: 'cmd',
+    payload: { cmd: 'brain connect demo C:/nope' },
+    exitCode: 1,
+    source: 'self',
+  });
+  assert.equal(hasFailureEvidence(db, projectId), false, 'its own bookkeeping is not evidence');
+
+  insertEvent(db, {
+    projectId,
+    type: 'error',
+    payload: { cmd: 'npm test', output: 'boom' },
+    exitCode: 1,
+    source: 'hook',
+  });
+  assert.equal(hasFailureEvidence(db, projectId), true, 'a real failure is evidence');
+  db.close();
+});
+
 test('a revert on record also satisfies the negative-premise guard', async () => {
   const { db, projectId } = seed();
   upsertCommit(db, {
@@ -237,5 +261,67 @@ test('a well-retrieved architecture question is allowed through', async () => {
   });
 
   assert.notEqual(answer.generator, 'insufficient-evidence');
+  db.close();
+});
+
+test('"what was the last thing i completed" quotes the newest informative commit', async () => {
+  const { db, projectId } = seed();
+  const now = Date.now();
+  // The newest commit is a vague one-liner; the informative one is a week old.
+  upsertCommit(db, {
+    projectId,
+    hash: 'b'.repeat(40),
+    message: 'idk anymore',
+    filesChanged: 2,
+    insertions: 4,
+    deletions: 1,
+    files: [
+      { path: 'src/a.ts', add: 3, del: 1 },
+      { path: 'src/b.ts', add: 1, del: 0 },
+    ],
+    ts: now - 3 * 86_400_000,
+  });
+  upsertCommit(db, {
+    projectId,
+    hash: 'a'.repeat(40),
+    message: 'feat: add the recall answer layer',
+    filesChanged: 1,
+    insertions: 120,
+    deletions: 4,
+    files: [{ path: 'src/core/answer.ts', add: 120, del: 4 }],
+    ts: now - 7 * 86_400_000,
+  });
+  const project = getProject(db, projectId);
+  assert.ok(project);
+
+  const answer = await answerQuestion(db, NO_LLM, {
+    query: 'what was the last thing i completed?',
+    project,
+    hits: [],
+  });
+
+  // It reads the commits and quotes the real work, files and all.
+  assert.match(answer.text, /recall answer layer/);
+  assert.match(answer.text, /src\/core\/answer\.ts/);
+  assert.doesNotMatch(answer.text, /do not remember|don't remember/i);
+  // It names the vague newest commit honestly rather than passing it off as work.
+  assert.match(answer.text, /idk anymore/);
+  assert.match(answer.text, /On record there are/);
+  db.close();
+});
+
+test('the completed-commit answer is not sent to the model when there is nothing on record', async () => {
+  const { db, projectId } = seed();
+  const project = getProject(db, projectId);
+  assert.ok(project);
+
+  const answer = await answerQuestion(db, NO_LLM, {
+    query: 'what did i last complete?',
+    project,
+    hits: [],
+  });
+
+  assert.match(answer.text, /Nothing is committed/);
+  assert.match(answer.text, /On record there are/);
   db.close();
 });
